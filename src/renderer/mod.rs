@@ -266,7 +266,6 @@ impl Renderer {
         let grid_scale = self.grid_renderer.grid_scale;
 
         let layer_grouping = self.settings.get::<RendererSettings>().experimental_layer_grouping;
-        root_canvas.clear(default_background);
         root_canvas.save();
         root_canvas.reset_matrix();
 
@@ -276,6 +275,12 @@ impl Renderer {
             let clip_rect = to_skia_rect(&root_window.pixel_region(grid_scale));
             root_canvas.clip_rect(clip_rect, None, Some(false));
         }
+
+        // Clear only after the clip is established, so the renderer only ever paints its own
+        // assigned rect (the given `content_region`, or the root window's region as a fallback)
+        // instead of blowing away the whole canvas regardless of what it was actually asked to
+        // own.
+        root_canvas.clear(default_background);
 
         let (root_windows, floating_layers) = {
             let (mut root_windows, mut floating_windows): (
