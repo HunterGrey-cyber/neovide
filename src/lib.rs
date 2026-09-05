@@ -6,6 +6,10 @@
 //! with hand-built or externally-sourced [`renderer::DrawCommand`]s) instead of only being
 //! reachable as the standalone `neovide` binary.
 //!
+//! [`demo_harness::DemoHarness`] packages that seam as a small, ready-to-embed API: a struct that
+//! owns a `Renderer` fed entirely fabricated content (no live `nvim --embed` connection) and a
+//! single per-frame method an external GTK/Skia host can call in its own render loop.
+//!
 //! This file is a deliberately separate crate root from `src/main.rs`, not a re-point of it:
 //! `main.rs` keeps its own private `mod` declarations exactly as before, so the existing
 //! `neovide` binary is completely unaffected by this file's existence (it still owns
@@ -39,6 +43,7 @@ pub mod bridge;
 pub mod channel_utils;
 pub mod clipboard;
 pub mod cmd_line;
+pub mod demo_harness;
 pub mod dimensions;
 pub mod editor;
 pub mod error_handling;
