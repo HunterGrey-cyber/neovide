@@ -50,6 +50,7 @@ pub mod error_handling;
 pub mod frame;
 #[cfg(target_os = "macos")]
 pub mod ipc;
+pub mod live_harness;
 pub mod platform;
 pub mod profiling;
 pub mod renderer;

@@ -1,0 +1,477 @@
+//! A [`crate::demo_harness::DemoHarness`]-shaped harness backed by a **real** `nvim --embed`
+//! connection, for an external host (e.g. a GTK4 `GtkGLArea`) to embed frame-by-frame.
+//!
+//! This exists for the neovibe P2 feasibility phase: P1's [`crate::demo_harness::DemoHarness`]
+//! proved a bare [`renderer::Renderer`] can be driven with fabricated content and no winit window;
+//! this module proves the same renderer can instead be driven by a *live* Neovim session — still
+//! with no winit-owned `Window`, no `window::application::Application`, and no
+//! `window::window_wrapper::WinitWindowWrapper` anywhere in the picture — while a headless
+//! `winit::event_loop::EventLoop<window::EventPayload>` (never `run_app`, never a `Window`
+//! created on it) delivers that session's async redraw traffic to the render thread.
+//!
+//! It reuses exactly the real plumbing the baseline P2 phase traced and
+//! `examples/embedded_nvim_smoke.rs` proved end-to-end:
+//! - [`bridge::NeovimRuntime::launch`] to spawn/attach the real `nvim --embed` child (internally
+//!   this also spawns and owns the real `editor::Editor`, on its own tokio task, that turns
+//!   nvim's redraw notifications into [`renderer::DrawCommand`] batches — this module never
+//!   constructs an `Editor` itself, it only ever sees the batches that side already produced,
+//!   arriving as `UserEvent::DrawCommandBatch`);
+//! - [`winit::platform::pump_events::EventLoopExtPumpEvents::pump_app_events`] to pump that event
+//!   loop non-blockingly once per frame (see [`LiveHarness::pump`]) — safe to call from inside a
+//!   shared GLib main loop per the sibling `poc/pump_events_spike` finding this phase's task
+//!   background cites, as long as nothing on that thread blocks synchronously for long;
+//! - a bare [`renderer::Renderer::handle_draw_commands`] to apply each arriving batch — the exact
+//!   seam `window::window_wrapper::WinitWindowWrapper`'s own pre-window-creation `RouteCore` path
+//!   already uses internally for real sessions, and the one `DemoHarness` already uses for
+//!   fabricated content;
+//! - [`bridge::send_ui`] + [`bridge::SerialCommand::Keyboard`] to forward keyboard input, and
+//!   [`bridge::ParallelCommand::Quit`] + [`crate::bridge::NeovimRuntime::shutdown_timeout`] for
+//!   shutdown — both confirmed end-to-end by the baseline phase and by
+//!   `examples/embedded_nvim_smoke.rs`, including that baseline's concretely-reproduced orphaned-
+//!   process failure mode and its fix (forcing `WindowSettings::confirm_quit` to `false` — see
+//!   [`LiveHarness::with_options`]'s doc).
+//!
+//! One thing this module does that the baseline's own smoke test deliberately sidestepped: it
+//! reproduces `window_wrapper.rs`'s private `flush_startup_messages_if_ready` (see the free
+//! function of the same name below) instead of disabling `startup_message_capture` outright, so a
+//! real embedding host's actual nvim config (start-screen plugins included) works without extra
+//! flags. See that function's own doc for exactly why this is a small, self-contained duplication
+//! rather than a change to `window_wrapper.rs` (which stays completely untouched, per this phase's
+//! scope discipline — as does everything else in `bridge`/`window::application`).
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use skia_safe::Canvas;
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, EventLoop},
+    platform::pump_events::EventLoopExtPumpEvents,
+    window::WindowId,
+};
+
+use crate::{
+    bridge::{NeovimHandler, NeovimRuntime, OpenMode, ParallelCommand, SerialCommand, send_ui},
+    clipboard::{Clipboard, ClipboardHandle},
+    cmd_line::CmdLineSettings,
+    renderer::{
+        DrawCommandResult, Renderer, RendererSettings, StartupMessageFlush,
+        cursor_renderer::CursorSettings, progress_bar::ProgressBarSettings,
+    },
+    running_tracker::RunningTracker,
+    settings::{Config, Settings},
+    units::{GridRect, GridSize, PixelRect},
+    window::{EventPayload, EventTarget, RouteId, UserEvent, WindowSettings, create_event_loop},
+};
+
+/// [`LiveHarness::render_frame`]'s internal pump never blocks: it only ever drains whatever is
+/// already queued. A host driving this once per paint (e.g. a `GtkGLArea` inside a shared GLib
+/// main loop) needs exactly that — nothing on that thread may block synchronously for long.
+const NON_BLOCKING: Duration = Duration::ZERO;
+
+/// How long [`LiveHarness::shutdown`] waits for a real `UserEvent::NeovimExited` after asking
+/// nvim to quit, before giving up and force-tearing-down the tokio runtime anyway. See that
+/// method's own doc for what "giving up" means in practice.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// Configuration for [`LiveHarness::with_options`]. [`LiveHarness::new`] is shorthand for
+/// `LiveHarness::with_options(LiveHarnessOptions { os_scale_factor, ..Default::default() })`.
+pub struct LiveHarnessOptions {
+    /// Forwarded unchanged to [`Renderer::new`] — the host's own display scale factor (`1.0` if
+    /// unknown/not applicable), exactly like [`crate::demo_harness::DemoHarness::new`]'s own
+    /// parameter of the same name.
+    pub os_scale_factor: f64,
+    /// Initial `nvim_ui_attach` grid size. `None` defers to Neovide's own default
+    /// (`settings::DEFAULT_GRID_SIZE`, 100x50 at the time of writing). This phase does not
+    /// implement `nvim_ui_resize` (that is neovibe's P7) — whatever is chosen here is the grid
+    /// size for the harness's entire lifetime.
+    pub grid_size: Option<GridSize<u32>>,
+    /// Working directory for the spawned `nvim --embed` child. `None` inherits this process's own
+    /// cwd — the same meaning `None` has for [`bridge::NeovimRuntime::launch`]'s own `cwd`
+    /// parameter.
+    pub cwd: Option<std::path::PathBuf>,
+    /// Extra arguments passed straight through to the `nvim` binary itself (after nvim's own
+    /// `--`), e.g. `vec!["--clean".to_string()]` for a deterministic session with no user
+    /// plugins/config loaded — the same passthrough `examples/embedded_nvim_smoke.rs` used.
+    /// Empty by default: a real embedding host gets the person's actual nvim config, startup
+    /// messages and all (see this module's own doc on why that is safe to do here).
+    pub extra_nvim_args: Vec<String>,
+}
+
+impl Default for LiveHarnessOptions {
+    fn default() -> Self {
+        Self { os_scale_factor: 1.0, grid_size: None, cwd: None, extra_nvim_args: Vec::new() }
+    }
+}
+
+/// The [`ApplicationHandler`] side of [`LiveHarness`]: the whole "turn an arriving `EventPayload`
+/// into renderer state" seam, reproduced from what `WinitWindowWrapper`/`Application` do for a
+/// real window today (see this module's doc for exactly what is, and isn't, reproduced).
+struct RouteEventHandler {
+    renderer: Renderer,
+    neovim_handler: NeovimHandler,
+    route_id: RouteId,
+    /// Set once a [`DrawCommandResult::should_show`] is observed — the same signal real Neovide
+    /// uses to decide it's safe to first reveal its window
+    /// (`WinitWindowWrapper::handle_draw_commands`'s `UIState::Initing -> FirstFrame`
+    /// transition). Monotonic: once true, stays true, mirroring `RouteCore::should_show_observed`.
+    is_ready: bool,
+    /// Count of `DrawCommandBatch` events applied so far — a cheap "did anything new happen"
+    /// signal for a host that wants one without an async round-trip into nvim.
+    redraw_batches_seen: u64,
+    neovim_exited: bool,
+}
+
+impl ApplicationHandler<EventPayload> for RouteEventHandler {
+    // Never called: this harness never creates a winit `Window` for the event loop to resume/
+    // deliver window events to — an external host owns its own GL surface instead, exactly like
+    // `DemoHarness`'s caller does. Required only to satisfy the trait.
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
+    ) {
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: EventPayload) {
+        let EventPayload { payload, target } = event;
+        match payload {
+            UserEvent::DrawCommandBatch(batch) => {
+                if !matches!(target, EventTarget::Route(route_id) if route_id == self.route_id) {
+                    return;
+                }
+                let mut result = self.renderer.handle_draw_commands(batch);
+                flush_startup_messages_if_ready(&mut result, &self.neovim_handler);
+                self.is_ready |= result.should_show;
+                self.redraw_batches_seen += 1;
+            }
+            UserEvent::NeovimExited => self.neovim_exited = true,
+            UserEvent::NeovimLaunchError { message } => {
+                // Confirmed (by reading every emitter of this variant) to not currently be
+                // reachable via this harness's own construction path: the only place in the
+                // codebase that ever sends it is `WinitWindowWrapper::request_window_creation`'s
+                // deferred-launch retry logic, which `LiveHarness` never calls — it calls
+                // `NeovimRuntime::launch` directly and surfaces that call's own real launch
+                // failures (missing/too-old nvim, tokio runtime build failure, ...) synchronously
+                // as an `Err` from `LiveHarness::new`/`with_options` instead. Logged (not silently
+                // dropped) in case that ever changes rather than exposed as public API for a path
+                // that provably never fires today — see this phase's report for the parallel to
+                // the baseline report's own §b finding (a real, currently-dead match arm).
+                log::warn!("[LiveHarness] unexpected UserEvent::NeovimLaunchError: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Reproduces `window::window_wrapper`'s private `flush_startup_messages_if_ready` free function
+/// (see the top of `src/window/window_wrapper.rs`) rather than silently sidestepping it via
+/// `--no-startup-message-capture` the way `examples/embedded_nvim_smoke.rs` did. That baseline
+/// report's own judgment call #3 flagged this as a decision the next phase (this one) should make
+/// deliberately: a real embedding host presumably wants a person's actual config, including
+/// plugins that print startup messages, and without this those messages/the cmdline stay
+/// externalized (`ext_messages`) forever with nothing on our side to un-externalize them.
+///
+/// Every type this touches — [`DrawCommandResult`], [`StartupMessageFlush`], [`ParallelCommand`],
+/// [`send_ui`] — is already `pub`, so this is a small, self-contained duplication of already-
+/// public-surface logic, not a change to `window_wrapper.rs` itself, which stays untouched.
+fn flush_startup_messages_if_ready(result: &mut DrawCommandResult, neovim_handler: &NeovimHandler) {
+    let Some(flush) = result.startup_message_flush.take() else {
+        return;
+    };
+    let messages = std::mem::take(&mut result.startup_messages);
+    let command = match flush {
+        StartupMessageFlush::Replay if messages.is_empty() => None,
+        StartupMessageFlush::Replay => Some(ParallelCommand::ReplayStartupMessages { messages }),
+        StartupMessageFlush::RestoreMessageUi => {
+            Some(ParallelCommand::FlushStartupMessages { messages })
+        }
+    };
+    if let Some(command) = command {
+        send_ui(command, neovim_handler);
+    }
+}
+
+/// Drives a real `nvim --embed` connection into a bare [`Renderer`], for an external host (e.g. a
+/// GTK4 `GtkGLArea`) to embed frame-by-frame — the P2 counterpart of
+/// [`crate::demo_harness::DemoHarness`]'s fabricated content. See this module's own doc for the
+/// full picture of what real plumbing this reuses and what it deliberately does not reproduce
+/// (full keyboard/IME translation, `nvim_ui_resize`, window/geometry lifecycle — all later
+/// neovibe phases' jobs, not this one's).
+///
+/// Construct with [`LiveHarness::new`] (or [`LiveHarness::with_options`] for more control), then
+/// each frame call [`LiveHarness::render_frame`] (which pumps internally — see its own doc) and
+/// forward any input via [`LiveHarness::send_text_input`]. Call [`LiveHarness::shutdown`]
+/// explicitly when the host is done with it (e.g. on window close) and read its return value;
+/// dropping without calling it first falls back to the same sequence from `Drop`, but see
+/// `shutdown`'s own doc for why that fallback is the less defensible choice.
+pub struct LiveHarness {
+    event_loop: EventLoop<EventPayload>,
+    state: RouteEventHandler,
+    neovim_handler: NeovimHandler,
+    runtime: NeovimRuntime,
+    // `Some` until `shutdown` drops it (while the event loop is still alive — see `shutdown`'s own
+    // comment on why that ordering matters for Wayland).
+    clipboard: Option<Arc<Mutex<Clipboard>>>,
+    shut_down: bool,
+}
+
+impl LiveHarness {
+    /// `LiveHarness::with_options(LiveHarnessOptions { os_scale_factor, ..Default::default() })`
+    /// — the common case: a real ambient nvim config, Neovide's own default grid size, this
+    /// process's own cwd. See [`LiveHarnessOptions`] for what to override and why.
+    pub fn new(os_scale_factor: f64) -> Result<Self> {
+        Self::with_options(LiveHarnessOptions { os_scale_factor, ..Default::default() })
+    }
+
+    /// Builds a headless `winit::event_loop::EventLoop<EventPayload>` (via
+    /// [`crate::window::create_event_loop`] — the exact function the real `neovide` binary calls
+    /// — no window ever created on it), a real [`ClipboardHandle`] wired through it, and a real
+    /// `nvim --embed` connection via [`bridge::NeovimRuntime::launch`] with `OpenMode::None`
+    /// ("launch a blank embedded instance" — the same semantically-minimal choice the baseline
+    /// report confirmed), then a bare [`Renderer`] to receive that session's redraw traffic.
+    ///
+    /// Registers the same `SettingGroup`s [`crate::demo_harness::DemoHarness::new`] and the
+    /// baseline's own smoke test register (`Renderer::new`/`NeovimRuntime::launch` both panic via
+    /// `Settings::get` on an unregistered/unset type otherwise), with one deliberate override:
+    /// `WindowSettings::confirm_quit` is forced to `false` unconditionally. The baseline report
+    /// found, and reproduced concretely (a real orphaned `nvim --embed` process, reparented to
+    /// init, confirmed via `ps`), that leaving this at its `true` default makes nvim's own quit
+    /// path run `:confirm qa` instead of `:qa!` — which blocks forever on an interactive save
+    /// prompt nothing here ever answers, and this codebase has **no force-kill fallback** for a
+    /// child stuck like that (see [`LiveHarness::shutdown`]'s own doc for the full detail, still
+    /// true here). Forcing this override is what makes that fallback-free shutdown path actually
+    /// reliable rather than merely hoped-for — empirically verified for this module the same way
+    /// the baseline verified it for its own example: see `examples/live_harness_offscreen.rs` and
+    /// this phase's report.
+    pub fn with_options(options: LiveHarnessOptions) -> Result<Self> {
+        let LiveHarnessOptions { os_scale_factor, grid_size, cwd, extra_nvim_args } = options;
+
+        let event_loop = create_event_loop();
+        let proxy = event_loop.create_proxy();
+
+        let settings = Arc::new(Settings::new());
+        settings.register::<WindowSettings>();
+        settings.register::<RendererSettings>();
+        settings.register::<CursorSettings>();
+        settings.register::<ProgressBarSettings>();
+
+        settings.set(&WindowSettings { confirm_quit: false, ..Default::default() });
+
+        // Mirrors the two established patterns already in this codebase rather than inventing a
+        // third: `CmdLineSettings::default()` (== `Self::parse_from(iter::empty::<String>())`,
+        // used identically by `DemoHarness::new`) when there is nothing to pass through, or the
+        // same `argv0, "--", ...` passthrough shape `examples/embedded_nvim_smoke.rs` used when
+        // there is. Deliberately does *not* pass `--no-startup-message-capture` — see this
+        // module's own doc on `flush_startup_messages_if_ready`.
+        let cmdline_settings = if extra_nvim_args.is_empty() {
+            CmdLineSettings::default()
+        } else {
+            let mut argv = vec!["neovide".to_string(), "--".to_string()];
+            argv.extend(extra_nvim_args);
+            CmdLineSettings::parse_from(argv)
+        };
+        settings.set(&cmdline_settings);
+
+        // Needs the `EventLoop` for the Wayland/X11 display handle even though no window exists —
+        // confirmed by the baseline report and `Clipboard::new`'s own signature.
+        let clipboard = Clipboard::new(&event_loop);
+        let clipboard_handle = ClipboardHandle::new(&clipboard);
+
+        let mut runtime = NeovimRuntime::new(clipboard_handle)
+            .context("failed to build the tokio runtime backing NeovimRuntime")?;
+
+        let route_id = RouteId::next();
+        let config = Config::default();
+        let running_tracker = RunningTracker::new();
+
+        let neovim_handler = runtime
+            .launch(
+                route_id,
+                proxy,
+                grid_size,
+                running_tracker,
+                settings.clone(),
+                &config,
+                cwd.as_deref(),
+                OpenMode::None,
+            )
+            .context("NeovimRuntime::launch failed — is `nvim` (>= 0.10) on $PATH?")?;
+
+        let renderer = Renderer::new(os_scale_factor, config, settings);
+
+        Ok(LiveHarness {
+            event_loop,
+            state: RouteEventHandler {
+                renderer,
+                neovim_handler: neovim_handler.clone(),
+                route_id,
+                is_ready: false,
+                redraw_batches_seen: 0,
+                neovim_exited: false,
+            },
+            neovim_handler,
+            runtime,
+            clipboard: Some(clipboard),
+            shut_down: false,
+        })
+    }
+
+    /// Drains whatever `EventPayload`s (redraw batches, `NeovimExited`, ...) are already queued on
+    /// the headless event loop, blocking for at most `timeout` waiting for more if none are
+    /// immediately available. [`render_frame`](Self::render_frame) already calls this internally
+    /// with a zero timeout (never blocks) every time it's called — call this directly yourself
+    /// only if the host wants to drain events on a different cadence than it repaints (e.g. an
+    /// idle callback that runs more often than paints, for lower input-round-trip latency).
+    /// Pumping redundantly is harmless.
+    pub fn pump(&mut self, timeout: Duration) {
+        self.event_loop.pump_app_events(Some(timeout), &mut self.state);
+    }
+
+    /// Advances animation state and paints one frame into `canvas` — the exact per-frame sequence
+    /// `WinitWindowWrapper` runs (`prepare_frame`, `animate_frame`, `prepare_lines`, `draw_frame`)
+    /// folded into one call, matching [`crate::demo_harness::DemoHarness::render_frame`]'s own
+    /// signature and doc exactly:
+    /// - `content_region`, when given, is the pixel rect within `canvas` this harness owns;
+    ///   drawing is clipped to it and the root grid is positioned to start at its top-left corner.
+    ///   `None` means "own the whole canvas".
+    /// - `dt` is the elapsed time in seconds since the previous call.
+    ///
+    /// Unlike `DemoHarness` (whose grid is a fixed compile-time constant), the fallback grid rect
+    /// used when `content_region` is `None` is read from the real, live
+    /// [`Renderer::get_grid_size`] — the actual `nvim_ui_attach` grid size in effect, once redraw
+    /// traffic has established one.
+    ///
+    /// Calls [`pump`](Self::pump) with a zero timeout first, so any redraw traffic that arrived
+    /// since the last call is applied before this frame paints. Returns `true` while ongoing
+    /// position/scroll/cursor animation would like another `render_frame` call soon — advisory
+    /// only, exactly like `DemoHarness::render_frame`'s own return value.
+    pub fn render_frame(
+        &mut self,
+        canvas: &Canvas,
+        content_region: Option<&PixelRect<f32>>,
+        dt: f32,
+    ) -> bool {
+        self.pump(NON_BLOCKING);
+
+        let renderer = &mut self.state.renderer;
+        renderer.prepare_frame();
+
+        let grid_scale = renderer.grid_renderer.grid_scale;
+        let grid_rect = content_region.map(|region| *region / grid_scale).unwrap_or_else(|| {
+            let grid_size = renderer.get_grid_size();
+            GridRect::from_min_max((0.0, 0.0), (grid_size.width as f32, grid_size.height as f32))
+        });
+
+        let animating = renderer.animate_frame(&grid_rect, dt);
+        renderer.prepare_lines(false);
+        renderer.draw_frame(canvas, content_region, dt);
+        animating
+    }
+
+    /// Forwards `text` toward the real nvim connection as one `nvim.input(...)` call — the exact
+    /// mechanism `WinitWindowWrapper`'s keyboard handling uses
+    /// ([`bridge::send_ui`] + [`bridge::SerialCommand::Keyboard`]), confirmed end-to-end by the
+    /// baseline report and `examples/embedded_nvim_smoke.rs`. Plain UTF-8 text, including nvim's
+    /// own `<key>` notation (e.g. `"ihello world<Esc>"` enters insert mode, types text, then
+    /// returns to normal mode) — full GTK-keyevent-to-Neovim-keycode translation is a later
+    /// neovibe input-system phase's job, not this one's.
+    pub fn send_text_input(&mut self, text: &str) {
+        send_ui(SerialCommand::Keyboard(text.to_string()), &self.neovim_handler);
+    }
+
+    /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own
+    /// `window::window_wrapper::RouteWindow` exposes as a `pub` field, for anything beyond plain
+    /// text input this harness's own API doesn't cover (arbitrary `nvim_command`/buffer
+    /// introspection/etc., via `handler.clone_current_neovim()`). Cheap to clone (`Arc`-backed).
+    pub fn neovim_handler(&self) -> NeovimHandler {
+        self.neovim_handler.clone()
+    }
+
+    /// Whether nvim's UI has produced enough real content that real Neovide would consider it
+    /// safe to first reveal its window ([`DrawCommandResult::should_show`] — the same flag
+    /// `WinitWindowWrapper::handle_draw_commands` uses for its own `UIState::Initing ->
+    /// FirstFrame` transition). Monotonic: never goes back to `false`.
+    pub fn is_ready(&self) -> bool {
+        self.state.is_ready
+    }
+
+    /// Count of `DrawCommandBatch` events applied so far — increases whenever new redraw traffic
+    /// has been applied to the renderer since construction. A cheap "did anything new happen"
+    /// signal; a host that just repaints unconditionally every frame doesn't need this.
+    pub fn redraw_batches_seen(&self) -> u64 {
+        self.state.redraw_batches_seen
+    }
+
+    /// Whether a real `UserEvent::NeovimExited` has been observed — nvim's child process/IO
+    /// stream finished (`bridge::mod::run`'s own doc). Also `true` after
+    /// [`shutdown`](Self::shutdown) observed it.
+    pub fn has_neovim_exited(&self) -> bool {
+        self.state.neovim_exited
+    }
+
+    /// Cleanly shuts down the real nvim connection: sends `ParallelCommand::Quit` (the exact
+    /// mechanism confirmed by the baseline report — `nvim.exec_lua(.., [is_remote])` running
+    /// `:qa!`, given the `confirm_quit` override [`with_options`](Self::with_options) applies),
+    /// waits up to 5s for the resulting `UserEvent::NeovimExited`, drops the clipboard while the
+    /// event loop is still alive (mirroring `window::application::Application::teardown`'s own
+    /// comment about releasing Wayland handles safely — see
+    /// <https://github.com/neovide/neovide/issues/3311>), then tears down the tokio runtime
+    /// backing the connection (`NeovimRuntime::shutdown_timeout`) regardless of whether that wait
+    /// succeeded.
+    ///
+    /// Returns `true` if `NeovimExited` was actually observed before the 5s wait elapsed; `false`
+    /// otherwise. **Callers should check this.** The baseline report found, and reproduced
+    /// concretely (a real orphaned `nvim --embed` process, reparented to init, confirmed via
+    /// `ps`), that nothing in this codebase force-kills a stuck child: dropping a
+    /// `tokio::process::Child` does not kill the OS process, and neither
+    /// `NeovimRuntime::shutdown_timeout` nor its own `Drop` impl reach far enough to do so — the
+    /// child PID isn't even exposed back to `bridge::NeovimRuntime::launch`'s own caller, this
+    /// module included. The `confirm_quit` override closes the one concrete way this was
+    /// reproduced (an unanswered `:confirm qa` save prompt), but anything else that blocks nvim's
+    /// own `:qa!` (a slow `BufWritePre` autocommand, a hung plugin, ...) has the same effect, and
+    /// this method's return value is your only signal that happened — there is currently no API
+    /// anywhere in this codebase to hard-kill the child yourself if it does. A later, genuinely
+    /// interactive phase should track the child PID independently for its own safety net, exactly
+    /// as the baseline report's own judgment call #4 flagged.
+    ///
+    /// Idempotent: a second call returns `true` immediately, without re-sending `Quit`.
+    pub fn shutdown(&mut self) -> bool {
+        if self.shut_down {
+            return true;
+        }
+        self.shut_down = true;
+
+        send_ui(ParallelCommand::Quit, &self.neovim_handler);
+
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        while !self.state.neovim_exited && Instant::now() < deadline {
+            self.event_loop.pump_app_events(Some(Duration::from_millis(20)), &mut self.state);
+        }
+        let exited = self.state.neovim_exited;
+
+        self.clipboard.take();
+        self.runtime.shutdown_timeout(Duration::from_millis(500));
+
+        exited
+    }
+}
+
+impl Drop for LiveHarness {
+    /// Defensive fallback only, mirroring `NeovimRuntime`'s own `Drop` impl's stance — harmless/
+    /// redundant on the already-shut-down happy path, best-effort otherwise. See
+    /// [`shutdown`](LiveHarness::shutdown)'s own doc for why calling it explicitly and checking
+    /// its return value is the more defensible choice for anything beyond a quick throwaway
+    /// script.
+    fn drop(&mut self) {
+        if !self.shut_down {
+            self.shutdown();
+        }
+    }
+}
