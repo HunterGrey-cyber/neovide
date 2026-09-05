@@ -20,6 +20,22 @@ impl DrawCommandBatcher {
         self.batch.push(draw_command);
     }
 
+    /// Take the currently queued batch of [`DrawCommand`]s without routing it through a winit
+    /// [`EventLoopProxy`]. This exists for callers that drive a [`crate::renderer::Renderer`]
+    /// directly (e.g. embedding it outside of Neovide's own winit-owned event loop, or feeding it
+    /// hand-constructed content) and therefore have no `EventLoopProxy<EventPayload>` to hand to
+    /// [`Self::send_batch`]. It intentionally ignores the `enabled`/`queued` bookkeeping used by
+    /// `NeovideSetRedraw`, since that mechanism only matters when commands are routed through the
+    /// event loop.
+    ///
+    /// Unused by the `neovide` binary itself (hence `#[allow(dead_code)]` here: the bin crate's
+    /// own copy of this module has no caller for it) — it's for the `neovide` *library* target's
+    /// consumers, where a `pub fn` is reachable API and not flagged as dead code.
+    #[allow(dead_code)]
+    pub fn take_batch(&mut self) -> Vec<DrawCommand> {
+        self.batch.split_off(0)
+    }
+
     pub fn set_enabled(
         &mut self,
         enabled: bool,

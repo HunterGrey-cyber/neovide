@@ -27,6 +27,13 @@ exclude = [
 ]
 resolver = "2"
 
+# Library target exposing the renderer/editor/bridge/settings/units internals for embedding
+# (see src/lib.rs). The `neovide` binary (src/main.rs) is a separate crate root and does not
+# depend on this target; it keeps building and behaving exactly as before.
+[lib]
+name = "neovide"
+path = "src/lib.rs"
+
 [package.metadata.bundle]
 name = "Neovide"
 identifier = "com.neovide.neovide"
