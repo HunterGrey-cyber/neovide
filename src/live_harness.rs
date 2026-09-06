@@ -63,8 +63,8 @@ use crate::{
         cursor_renderer::CursorSettings, progress_bar::ProgressBarSettings,
     },
     running_tracker::RunningTracker,
-    settings::{Config, Settings},
-    units::{GridRect, GridSize, PixelRect},
+    settings::{Config, Settings, clamped_grid_size},
+    units::{GridRect, GridScale, GridSize, PixelRect},
     window::{EventPayload, EventTarget, RouteId, UserEvent, WindowSettings, create_event_loop},
 };
 
@@ -86,9 +86,14 @@ pub struct LiveHarnessOptions {
     /// parameter of the same name.
     pub os_scale_factor: f64,
     /// Initial `nvim_ui_attach` grid size. `None` defers to Neovide's own default
-    /// (`settings::DEFAULT_GRID_SIZE`, 100x50 at the time of writing). This phase does not
-    /// implement `nvim_ui_resize` (that is neovibe's P7) — whatever is chosen here is the grid
-    /// size for the harness's entire lifetime.
+    /// (`settings::DEFAULT_GRID_SIZE`, 100x50 at the time of writing). Purely a launch-time
+    /// value — call [`LiveHarness::resize_grid`] any time afterward to change it. (Earlier,
+    /// this doc said no such method existed and whatever was chosen here was the grid size for
+    /// the harness's entire lifetime; that was true until the P2 "frozen scroll" bug — a host
+    /// resize never reaching nvim's own idea of the grid — made it clear a live resize path was
+    /// needed. See `resize_grid`'s own doc for the mechanism and why a host should still pick a
+    /// sensible starting value here rather than relying on the default-then-immediately-resize
+    /// pattern for every construction.)
     pub grid_size: Option<GridSize<u32>>,
     /// Working directory for the spawned `nvim --embed` child. `None` inherits this process's own
     /// cwd — the same meaning `None` has for [`bridge::NeovimRuntime::launch`]'s own `cwd`
@@ -207,7 +212,9 @@ fn flush_startup_messages_if_ready(result: &mut DrawCommandResult, neovim_handle
 ///
 /// Construct with [`LiveHarness::new`] (or [`LiveHarness::with_options`] for more control), then
 /// each frame call [`LiveHarness::render_frame`] (which pumps internally — see its own doc) and
-/// forward any input via [`LiveHarness::send_text_input`]. Call [`LiveHarness::shutdown`]
+/// forward any input via [`LiveHarness::send_text_input`]. Call [`LiveHarness::resize_grid`]
+/// whenever the host's own visible viewport size changes cell-count — see that method's own doc
+/// for why this exists and what breaks without it. Call [`LiveHarness::shutdown`]
 /// explicitly when the host is done with it (e.g. on window close) and read its return value;
 /// dropping without calling it first falls back to the same sequence from `Drop`, but see
 /// `shutdown`'s own doc for why that fallback is the less defensible choice.
@@ -384,6 +391,65 @@ impl LiveHarness {
     /// neovibe input-system phase's job, not this one's.
     pub fn send_text_input(&mut self, text: &str) {
         send_ui(SerialCommand::Keyboard(text.to_string()), &self.neovim_handler);
+    }
+
+    /// The renderer's current font-derived grid scale (pixels per grid cell) — mirrors what
+    /// [`render_frame`](Self::render_frame) already reads internally
+    /// (`renderer.grid_renderer.grid_scale`) and what
+    /// `WinitWindowWrapper::update_grid_size_from_window` reads for a real OS window. A host
+    /// needs this to convert a pixel-sized viewport into the (cols, rows) to pass to
+    /// [`resize_grid`](Self::resize_grid) — e.g. `pixel_size / harness.grid_scale()` (see
+    /// `units::GridScale`'s `Div` impl) gives a `GridSize<f32>` to floor and clamp.
+    pub fn grid_scale(&self) -> GridScale {
+        self.state.renderer.grid_renderer.grid_scale
+    }
+
+    /// The live grid size currently in effect, as last established by redraw traffic — the same
+    /// value [`render_frame`](Self::render_frame) falls back to when its own `content_region`
+    /// argument is `None`.
+    pub fn get_grid_size(&self) -> GridSize<u32> {
+        self.state.renderer.get_grid_size()
+    }
+
+    /// Asks nvim to resize its own UI grid to `grid_size` (clamped via
+    /// [`crate::settings::clamped_grid_size`], the same clamp
+    /// `WinitWindowWrapper::update_window_size_from_grid`/`update_grid_size_from_window` apply to
+    /// their own grid sizes) — callable any time after construction, unlike
+    /// [`LiveHarnessOptions::grid_size`], which only ever set nvim's size once at
+    /// `nvim_ui_attach` time.
+    ///
+    /// This is the fix for the neovibe P2 "frozen scroll" bug: before this method existed,
+    /// nothing in this module ever revised nvim's own idea of the grid size after launch, so a
+    /// host's `content_region` could permanently diverge from what nvim thought the window's
+    /// row/col count was — including across every subsequent host-side resize, since neither
+    /// `render_frame` nor anything else in this file ever called into nvim's grid on a resize.
+    /// Per Neovim's own UI protocol, a cursor motion whose target line stays within nvim's
+    /// (stale, host-visible-size-agnostic) row count is legitimately not a scroll at all, so
+    /// Neovim correctly never emits `grid_scroll`/`win_viewport` redraw traffic for it — while
+    /// cursor-position and gutter redraws (driven independently of whether a scroll occurred)
+    /// keep updating on every cursor move regardless. That combination is exactly the reported
+    /// symptom: the line-number gutter tracks the cursor correctly while the buffer text itself
+    /// stays visually frozen on whatever screenful was showing when the fixed grid size was
+    /// established. Calling this method whenever the host's real viewport's cell-count changes —
+    /// including once right after construction, since [`LiveHarnessOptions::grid_size`]'s launch
+    /// value may not match the host's actual initial content region either — keeps nvim's own
+    /// grid state honest, which is what lets it decide correctly (and start emitting real
+    /// `grid_scroll` traffic) once a motion actually needs to move the viewport.
+    ///
+    /// Uses the exact same RPC `WinitWindowWrapper::update_grid_size_from_window` uses
+    /// (`ParallelCommand::Resize` → `nvim.ui_try_resize`), just without that struct's own
+    /// per-route `last_synced_grid_size` bookkeeping: this method sends the RPC unconditionally
+    /// on every call, so a caller that resizes on every pixel-level event (e.g. a live window
+    /// drag) should dedupe on the resulting *grid-cell* size itself first — comparing against
+    /// [`get_grid_size`](Self::get_grid_size) or a value cached from a previous call — to avoid
+    /// spamming nvim with redundant resize RPCs mid-drag, exactly like
+    /// `poc/neovide_embed_live`'s own resize handler does.
+    pub fn resize_grid(&mut self, grid_size: GridSize<u32>) {
+        let grid_size = clamped_grid_size(&grid_size);
+        send_ui(
+            ParallelCommand::Resize { width: grid_size.width.into(), height: grid_size.height.into() },
+            &self.neovim_handler,
+        );
     }
 
     /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own
