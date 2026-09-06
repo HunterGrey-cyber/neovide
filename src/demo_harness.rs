@@ -135,45 +135,42 @@ impl DemoHarness {
         styles
     }
 
+    /// Splits `text` into one [`GridLineCell`] per character, each tagged with `highlight_id`.
+    ///
+    /// This matters more than it looks: a `GridLineCell` represents exactly one grid *cell* (see
+    /// its doc comment — "will be an empty string for the right cell of a double-width char"),
+    /// mirroring how real `nvim --embed` actually sends `grid_line` events. Packing a whole
+    /// multi-character string into a single cell (the bug this replaces) corrupts glyph
+    /// positioning: `CachingShaper::build_clusters` tags every character of a cell's text with
+    /// that one cell's grid index, and `shape()` resets its `x_offset` to `glyph_width *
+    /// cell_index` at the start of every swash-detected cluster. Independent Latin letters each
+    /// form their own cluster, so every letter's `x_offset` collapses to the same value — all
+    /// glyphs draw stacked on top of each other instead of advancing, which reads as "no visible
+    /// text" rather than "misaligned text". One cell per character avoids this entirely.
+    fn text_cells(text: &str, highlight_id: u64) -> Vec<GridLineCell> {
+        text.chars()
+            .map(|ch| GridLineCell {
+                text: ch.to_string(),
+                highlight_id: Some(highlight_id),
+                repeat: None,
+            })
+            .collect()
+    }
+
     fn draw_demo_lines(
         window: &mut Window,
         batcher: &mut DrawCommandBatcher,
         styles: &HashMap<u64, Arc<Style>>,
     ) {
-        window.draw_grid_line(
-            batcher,
-            0,
-            0,
-            vec![GridLineCell {
-                text: "Hello, neovibe!".to_string(),
-                highlight_id: Some(0),
-                repeat: None,
-            }],
-            styles,
-        );
+        window.draw_grid_line(batcher, 0, 0, Self::text_cells("Hello, neovibe!", 0), styles);
+
         // Two different highlights on the same line, exercising >1 highlight/color per line.
-        window.draw_grid_line(
-            batcher,
-            1,
-            0,
-            vec![
-                GridLineCell { text: "ERROR".to_string(), highlight_id: Some(1), repeat: None },
-                GridLineCell { text: " ".to_string(), highlight_id: Some(0), repeat: None },
-                GridLineCell { text: "accent".to_string(), highlight_id: Some(2), repeat: None },
-            ],
-            styles,
-        );
-        window.draw_grid_line(
-            batcher,
-            2,
-            0,
-            vec![GridLineCell {
-                text: "scroll me".to_string(),
-                highlight_id: Some(0),
-                repeat: None,
-            }],
-            styles,
-        );
+        let mut row1_cells = Self::text_cells("ERROR", 1);
+        row1_cells.extend(Self::text_cells(" ", 0));
+        row1_cells.extend(Self::text_cells("accent", 2));
+        window.draw_grid_line(batcher, 1, 0, row1_cells, styles);
+
+        window.draw_grid_line(batcher, 2, 0, Self::text_cells("scroll me", 0), styles);
     }
 
     fn queue_scroll(&mut self) {
@@ -215,6 +212,7 @@ impl DemoHarness {
         dt: f32,
     ) -> bool {
         self.elapsed += dt;
+
         if !self.scrolled && self.elapsed >= SCROLL_DELAY_SECS {
             self.scrolled = true;
             self.queue_scroll();
