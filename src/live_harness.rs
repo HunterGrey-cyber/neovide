@@ -61,6 +61,7 @@ use crate::{
     renderer::{
         DrawCommandResult, Renderer, RendererSettings, StartupMessageFlush,
         cursor_renderer::CursorSettings, progress_bar::ProgressBarSettings,
+        rendered_window::BASE_GRID_ID,
     },
     running_tracker::RunningTracker,
     settings::{Config, Settings, clamped_grid_size},
@@ -391,6 +392,93 @@ impl LiveHarness {
     /// neovibe input-system phase's job, not this one's.
     pub fn send_text_input(&mut self, text: &str) {
         send_ui(SerialCommand::Keyboard(text.to_string()), &self.neovim_handler);
+    }
+
+    /// Forwards a mouse button press/release toward the real nvim connection as one
+    /// `nvim.input_mouse(...)` call — the exact mechanism
+    /// `window::mouse_manager::MouseManager::send_nvim_mouse_button` uses
+    /// ([`bridge::send_ui`] + [`bridge::SerialCommand::MouseButton`]), just without that struct's
+    /// own per-window hit-testing (see below).
+    ///
+    /// `button` is nvim's own button-text notation — `"left"`/`"right"`/`"middle"`/`"x1"`/`"x2"`
+    /// (see `window::mouse_manager::mouse_button_to_button_text` for the mapping this mirrors);
+    /// any other string is passed straight through to nvim, which will reject it. `pressed`
+    /// selects `"press"` vs `"release"`. `grid_pos` is the (col, row) grid cell the event
+    /// happened at, in nvim's own row/col convention — the host is expected to have already
+    /// converted its own pixel coordinates via [`grid_scale`](Self::grid_scale) the same way it
+    /// already does for [`resize_grid`](Self::resize_grid)'s own grid-size math, then clamped
+    /// against [`get_grid_size`](Self::get_grid_size). `modifier_string` is nvim's own
+    /// modifier-prefix notation (e.g. `"C-S-"`, or `""` for none) — a caller with no modifier
+    /// tracker of its own can pass `""`, exactly like [`send_text_input`](Self::send_text_input)'s
+    /// own callers may already do for plain keystrokes.
+    ///
+    /// Always targets the single base grid ([`BASE_GRID_ID`], nvim's always-present grid 1) —
+    /// unlike the reference `MouseManager`, this harness does not track per-window pixel regions
+    /// the way a real multi-split Neovide window does
+    /// (`window::mouse_manager::MouseManager::get_window_details_under_mouse`), so this method has
+    /// no way to route a click to whichever split/floating window it visually landed on. That
+    /// matches every host of this harness built so far (a single undivided editor pane, per
+    /// `poc/neovide_embed_live`'s own scope) — a later phase that adds split-aware layout tracking
+    /// would need to extend this rather than call it as-is.
+    pub fn send_mouse_button(
+        &mut self,
+        button: &str,
+        pressed: bool,
+        grid_pos: (u32, u32),
+        modifier_string: &str,
+    ) {
+        send_ui(
+            SerialCommand::MouseButton {
+                button: button.to_string(),
+                action: if pressed { "press".to_string() } else { "release".to_string() },
+                grid_id: BASE_GRID_ID,
+                position: grid_pos,
+                modifier_string: modifier_string.to_string(),
+            },
+            &self.neovim_handler,
+        );
+    }
+
+    /// Forwards a mouse-moved-while-a-button-is-held event, via [`bridge::SerialCommand::Drag`]
+    /// — the same RPC `window::mouse_manager::MouseManager::handle_pointer_motion` sends once
+    /// per grid-cell change while `drag_details` is `Some`. Unlike that reference (which tracks
+    /// the drag's own previous grid cell internally and only calls `send_ui` when it actually
+    /// changed), this method sends unconditionally on every call — callers should dedupe on
+    /// `grid_pos` actually changing themselves first, exactly like
+    /// [`resize_grid`](Self::resize_grid)'s own doc asks resize callers to dedupe on grid-cell
+    /// size. See [`send_mouse_button`](Self::send_mouse_button) for what `button`/`grid_pos`/
+    /// `modifier_string` mean and the single-base-grid caveat.
+    pub fn send_mouse_drag(&mut self, button: &str, grid_pos: (u32, u32), modifier_string: &str) {
+        send_ui(
+            SerialCommand::Drag {
+                button: button.to_string(),
+                grid_id: BASE_GRID_ID,
+                position: grid_pos,
+                modifier_string: modifier_string.to_string(),
+            },
+            &self.neovim_handler,
+        );
+    }
+
+    /// Forwards one wheel-scroll "line crossed" event, via [`bridge::SerialCommand::Scroll`] —
+    /// the same RPC `window::mouse_manager::MouseManager::handle_line_scroll` sends, once per
+    /// call. `direction` is nvim's own scroll-direction notation — `"up"`/`"down"`/`"left"`/
+    /// `"right"`. A caller with a fractional/pixel-based scroll delta (a touchpad, or a high-
+    /// resolution wheel) should accumulate it and call this once per whole grid-line crossed,
+    /// exactly like `handle_line_scroll`/`handle_pixel_scroll` do (accumulate a running total,
+    /// compare `floor()` before and after, call this once per integer step crossed) — this
+    /// method itself does no accumulation. See [`send_mouse_button`](Self::send_mouse_button) for
+    /// what `grid_pos`/`modifier_string` mean and the single-base-grid caveat.
+    pub fn send_mouse_scroll(&mut self, direction: &str, grid_pos: (u32, u32), modifier_string: &str) {
+        send_ui(
+            SerialCommand::Scroll {
+                direction: direction.to_string(),
+                grid_id: BASE_GRID_ID,
+                position: grid_pos,
+                modifier_string: modifier_string.to_string(),
+            },
+            &self.neovim_handler,
+        );
     }
 
     /// The renderer's current font-derived grid scale (pixels per grid cell) — mirrors what
