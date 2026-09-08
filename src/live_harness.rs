@@ -65,7 +65,7 @@ use crate::{
     },
     running_tracker::RunningTracker,
     settings::{Config, Settings, clamped_grid_size},
-    units::{GridRect, GridScale, GridSize, PixelRect},
+    units::{GridRect, GridScale, GridSize, PixelPos, PixelRect},
     window::{EventPayload, EventTarget, RouteId, UserEvent, WindowSettings, create_event_loop},
 };
 
@@ -490,6 +490,32 @@ impl LiveHarness {
     /// `units::GridScale`'s `Div` impl) gives a `GridSize<f32>` to floor and clamp.
     pub fn grid_scale(&self) -> GridScale {
         self.state.renderer.grid_renderer.grid_scale
+    }
+
+    /// The top-left corner of the cursor's current *destination* cell, in the same pixel space the
+    /// `content_region` handed to [`render_frame`](Self::render_frame) is expressed in — i.e. the
+    /// canvas's own device-pixel space, already including the `content_region.min` offset, so a
+    /// host can use it directly against its own surface geometry without re-adding that origin.
+    ///
+    /// Reads [`Renderer::get_cursor_destination`] (`CursorRenderer::destination`), which
+    /// [`render_frame`](Self::render_frame) itself refreshes every frame via
+    /// `Renderer::animate_frame` → `CursorRenderer::update_cursor_destination`. That value is
+    /// computed as `(cursor_grid_position + window.grid_current_position) * grid_scale`, and
+    /// `grid_current_position` is in turn derived from the `grid_rect` (`content_region /
+    /// grid_scale`) `render_frame` passes down — which is exactly why the returned position is
+    /// already content-region-relative rather than grid-origin-relative.
+    ///
+    /// Note this is the *destination* (where the cursor is settling), not the smoothed, mid-flight
+    /// animated position — deliberately, since the one consumer this exists for is an embedding
+    /// host telling the platform input method where to place its candidate window
+    /// (`gtk_im_context_set_cursor_location`), which wants the settled cell, not a position that
+    /// moves under the popup for the length of a cursor animation. Pair it with
+    /// [`grid_scale`](Self::grid_scale) to get the cell's size.
+    ///
+    /// Added for neovibe's P4 (IME candidate-window placement); a thin read-only geometry getter,
+    /// deliberately within the fork's own surface/geometry divergence budget.
+    pub fn cursor_pixel_position(&self) -> PixelPos<f32> {
+        self.state.renderer.get_cursor_destination()
     }
 
     /// The live grid size currently in effect, as last established by redraw traffic — the same
