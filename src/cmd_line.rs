@@ -260,6 +260,30 @@ pub struct CmdLineSettings {
     /// Change to this directory during startup.
     #[arg(long = "chdir", env = "NEOVIDE_CHDIR")]
     pub chdir: Option<String>,
+
+    /// Extra environment variables to set on the spawned `nvim` child process only, as
+    /// `(name, value)` pairs applied by [`crate::bridge::create_tokio_nvim_command`] /
+    /// [`crate::bridge::create_blocking_nvim_command`] via `Command::env`.
+    ///
+    /// **Not a command-line flag** (`#[arg(skip)]`) -- there is deliberately no way to set this
+    /// from argv. It exists for an *embedding host* (see [`crate::live_harness::LiveHarness`],
+    /// and `LiveHarnessOptions::child_env` specifically) that needs the embedded nvim to see
+    /// environment variables the host process itself must not have. Carrying them on this struct
+    /// rather than calling `std::env::set_var` is what keeps the injection scoped to the one
+    /// child: `std::env::set_var` mutates process-global state (and is `unsafe` in Rust 2024 for
+    /// exactly that reason), so it would leak into every other subprocess the host spawns and
+    /// race any concurrent `getenv` in a multi-threaded GUI process.
+    ///
+    /// Pairs are applied in order, on top of the environment the child inherits from its parent,
+    /// so a name that already exists in the parent environment is *replaced* rather than merged
+    /// -- a host prepending to `PATH` must compose the whole new value itself.
+    ///
+    /// Platform note: honored directly on Linux and Windows, where the built spec is the nvim
+    /// binary itself. On macOS's desktop-launch path the spec is `/usr/bin/login -fpq ...`
+    /// wrapping a login shell, so these land on `login` and only reach nvim insofar as that path
+    /// preserves the environment; nothing depends on that today.
+    #[arg(skip)]
+    pub child_env: Vec<(String, String)>,
 }
 
 // geometry, size and maximized are mutually exclusive

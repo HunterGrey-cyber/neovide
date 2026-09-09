@@ -106,11 +106,32 @@ pub struct LiveHarnessOptions {
     /// Empty by default: a real embedding host gets the person's actual nvim config, startup
     /// messages and all (see this module's own doc on why that is safe to do here).
     pub extra_nvim_args: Vec<String>,
+    /// Extra `(name, value)` environment variables set on the spawned `nvim --embed` child
+    /// process **only** — never on the host process that constructs this harness. Applied on top
+    /// of the environment the child inherits, so a name that already exists in the host's own
+    /// environment is replaced (a host prepending to `PATH` must compose the whole value itself).
+    ///
+    /// This exists because an embedding host may need the embedded nvim to believe something
+    /// about its environment that must not be true of the host: neovibe's `shell` sets `TMUX`,
+    /// `TMUX_PANE` and a `PATH` carrying a fake `tmux` shim, so `vim-tmux-navigator` running
+    /// inside the embedded nvim forwards a `Ctrl-h`/`Ctrl-l` that hit nvim's own window boundary
+    /// out to the host as a pane-switch request — while the host process itself, and every other
+    /// subprocess it spawns, keep a completely untouched environment.
+    ///
+    /// Empty by default. Forwarded to [`crate::cmd_line::CmdLineSettings::child_env`]; see that
+    /// field's doc for why this is a per-child channel rather than `std::env::set_var`.
+    pub child_env: Vec<(String, String)>,
 }
 
 impl Default for LiveHarnessOptions {
     fn default() -> Self {
-        Self { os_scale_factor: 1.0, grid_size: None, cwd: None, extra_nvim_args: Vec::new() }
+        Self {
+            os_scale_factor: 1.0,
+            grid_size: None,
+            cwd: None,
+            extra_nvim_args: Vec::new(),
+            child_env: Vec::new(),
+        }
     }
 }
 
@@ -259,7 +280,8 @@ impl LiveHarness {
     /// the baseline verified it for its own example: see `examples/live_harness_offscreen.rs` and
     /// this phase's report.
     pub fn with_options(options: LiveHarnessOptions) -> Result<Self> {
-        let LiveHarnessOptions { os_scale_factor, grid_size, cwd, extra_nvim_args } = options;
+        let LiveHarnessOptions { os_scale_factor, grid_size, cwd, extra_nvim_args, child_env } =
+            options;
 
         let event_loop = create_event_loop();
         let proxy = event_loop.create_proxy();
@@ -278,13 +300,18 @@ impl LiveHarness {
         // same `argv0, "--", ...` passthrough shape `examples/embedded_nvim_smoke.rs` used when
         // there is. Deliberately does *not* pass `--no-startup-message-capture` — see this
         // module's own doc on `flush_startup_messages_if_ready`.
-        let cmdline_settings = if extra_nvim_args.is_empty() {
+        let mut cmdline_settings = if extra_nvim_args.is_empty() {
             CmdLineSettings::default()
         } else {
             let mut argv = vec!["neovide".to_string(), "--".to_string()];
             argv.extend(extra_nvim_args);
             CmdLineSettings::parse_from(argv)
         };
+        // `child_env` has no argv spelling by design (`#[arg(skip)]`), so it is assigned here
+        // rather than folded into the passthrough above. This `Settings` instance belongs to this
+        // one `LiveHarness`, so the injection can never reach another harness, the host process,
+        // or any other subprocess the host spawns.
+        cmdline_settings.child_env = child_env;
         settings.set(&cmdline_settings);
 
         // Needs the `EventLoop` for the Wayland/X11 display handle even though no window exists —

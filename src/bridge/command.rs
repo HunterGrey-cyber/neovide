@@ -43,6 +43,12 @@ pub enum OpenMode {
 struct CommandSpec {
     program: String,
     args: Vec<String>,
+    /// Extra `(name, value)` environment pairs set on this one child process, on top of whatever
+    /// it inherits from the parent. Sourced from [`CmdLineSettings::child_env`] -- see that
+    /// field's own doc for why an embedding host needs a per-child channel here instead of
+    /// `std::env::set_var`. Empty for every launch path that doesn't set it, which is all of
+    /// them except an embedding host that explicitly asks.
+    env: Vec<(String, String)>,
     #[cfg(target_os = "windows")]
     creation_flags: Option<u32>,
 }
@@ -52,9 +58,15 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args,
+            env: Vec::new(),
             #[cfg(target_os = "windows")]
             creation_flags: None,
         }
+    }
+
+    fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 
     #[cfg(target_os = "windows")]
@@ -67,7 +79,8 @@ impl CommandSpec {
 pub fn create_blocking_nvim_command(cmdline_settings: &CmdLineSettings, embed: bool) -> StdCommand {
     let (bin, args) = build_nvim_command_parts(cmdline_settings, embed, OpenMode::Startup);
     let cwd = command_cwd(cmdline_settings, None);
-    let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref());
+    let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref())
+        .with_env(cmdline_settings.child_env.clone());
     let mut cmd = std_command_from_spec(spec);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -83,7 +96,8 @@ pub fn create_tokio_nvim_command(
 ) -> TokioCommand {
     let (bin, args) = build_nvim_command_parts(cmdline_settings, embed, mode);
     let cwd = command_cwd(cmdline_settings, cwd);
-    let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref());
+    let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref())
+        .with_env(cmdline_settings.child_env.clone());
     let mut cmd = tokio_command_from_spec(spec);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -152,11 +166,15 @@ fn tokio_command_from_spec(spec: CommandSpec) -> TokioCommand {
     let CommandSpec {
         program,
         args,
+        env,
         #[cfg(target_os = "windows")]
         creation_flags,
     } = spec;
     let mut result = TokioCommand::new(program);
     result.args(&args);
+    for (name, value) in &env {
+        result.env(name, value);
+    }
     #[cfg(target_os = "windows")]
     if let Some(flags) = creation_flags {
         result.creation_flags(flags);
@@ -168,11 +186,15 @@ fn std_command_from_spec(spec: CommandSpec) -> StdCommand {
     let CommandSpec {
         program,
         args,
+        env,
         #[cfg(target_os = "windows")]
         creation_flags,
     } = spec;
     let mut result = StdCommand::new(program);
     result.args(&args);
+    for (name, value) in &env {
+        result.env(name, value);
+    }
     #[cfg(target_os = "windows")]
     if let Some(flags) = creation_flags {
         result.creation_flags(flags);
@@ -388,6 +410,51 @@ mod tests {
 
         assert_eq!(bin, "ssh");
         assert_eq!(args, vec!["my-server", "nvim", "--embed"]);
+    }
+
+    #[test]
+    fn child_env_reaches_the_spawned_command_and_defaults_to_empty() {
+        let mut cmdline_settings = parse_cmdline_settings(&["neovide"]);
+        assert!(
+            cmdline_settings.child_env.is_empty(),
+            "child_env must default to empty -- no launch path may gain env vars it didn't ask for"
+        );
+
+        // The neovibe pane-switch use case: a fake `tmux` on the child's PATH plus the two env
+        // vars vim-tmux-navigator reads, none of which may exist in the host process itself.
+        cmdline_settings.child_env = vec![
+            ("TMUX".to_string(), "/tmp/neovibe.sock,0,0".to_string()),
+            ("TMUX_PANE".to_string(), "%0".to_string()),
+            ("PATH".to_string(), "/tmp/shimdir:/usr/bin".to_string()),
+        ];
+
+        let command = create_tokio_nvim_command(&cmdline_settings, true, None, OpenMode::None);
+        let std_command = command.as_std();
+        // `Command::get_envs` reports the override map sorted by name, not in insertion order.
+        let mut applied: Vec<(String, String)> = std_command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.expect("neovibe child_env never removes a variable")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect();
+        applied.sort();
+
+        assert_eq!(
+            applied,
+            vec![
+                ("PATH".to_string(), "/tmp/shimdir:/usr/bin".to_string()),
+                ("TMUX".to_string(), "/tmp/neovibe.sock,0,0".to_string()),
+                ("TMUX_PANE".to_string(), "%0".to_string()),
+            ]
+        );
+        // These are *overrides layered on the inherited environment*, not a replacement of it --
+        // `Command::env_clear` is never called, so the child still gets HOME/XDG_*/etc. and only
+        // the three names above are changed.
     }
 
     #[test]
