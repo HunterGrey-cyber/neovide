@@ -37,7 +37,11 @@
 //! real embedding host's actual nvim config (start-screen plugins included) works without extra
 //! flags. See that function's own doc for exactly why this is a small, self-contained duplication
 //! rather than a change to `window_wrapper.rs` (which stays completely untouched, per this phase's
-//! scope discipline — as does everything else in `bridge`/`window::application`).
+//! scope discipline — as does everything else in `bridge`/`window::application`). A host whose
+//! own config externalises the cmdline, and which therefore loses a screen row to the capture's
+//! restore step, can turn the capture off through
+//! [`LiveHarnessOptions::startup_message_capture`] — that field's doc has the measurement and the
+//! cost.
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -121,6 +125,40 @@ pub struct LiveHarnessOptions {
     /// Empty by default. Forwarded to [`crate::cmd_line::CmdLineSettings::child_env`]; see that
     /// field's doc for why this is a per-child channel rather than `std::env::set_var`.
     pub child_env: Vec<(String, String)>,
+    /// Whether to run Neovide's startup-message capture — the same thing
+    /// [`crate::cmd_line::CmdLineSettings::startup_message_capture`] (`--startup-message-capture`
+    /// / `--no-startup-message-capture`) controls for the real binary. **`true` by default, so a
+    /// host that does not mention this field gets exactly the behaviour this harness has always
+    /// had.**
+    ///
+    /// What the capture does, in order (`bridge::launch` and
+    /// `bridge::ui_commands::restore_builtin_message_ui`): read `cmdheight` *before* the
+    /// `nvim_ui_attach` that triggers loading the user's config, attach with `ext_messages` on so
+    /// that anything printed before the first grid render arrives as a `msg_show` this side can
+    /// hold rather than as a screenful behind a hit-enter prompt, then — on the first flush —
+    /// turn `ext_messages`/`ext_cmdline` back off, write that pre-attach `cmdheight` back, and
+    /// replay the held messages. See <https://github.com/neovide/neovide/issues/3499>.
+    ///
+    /// Why an embedding host may want it **off**: that last step hands the built-in cmdline row
+    /// back unconditionally, and for a config that externalises the cmdline itself (noice.nvim
+    /// and friends, through `vim.ui_attach`) nothing ever paints there again. The pre-attach
+    /// `cmdheight` is the stock `1` — nvim has not read the user's config at that point — so the
+    /// restore writes `1` over the `0` such a config chose, and the bottom row of the host's pane
+    /// is dead for the rest of the session. Measured at the nvim protocol level on a 36-row grid:
+    /// with the capture on, nvim lays out 34 window rows + 1 global statusline and never uses the
+    /// 36th; with it off, 35 window rows + 1 statusline fill the grid exactly.
+    ///
+    /// What opting out costs, measured rather than assumed (`nvim --embed` attached with the
+    /// exact options `bridge` uses, against a config that `error()`s while loading):
+    /// `ext_messages` is **not** attached at all — it is set only inside the same
+    /// `if capture_startup_messages` that reads the pre-attach `cmdheight` — so nvim keeps its
+    /// own message UI, and a startup error is painted onto the built-in message grid
+    /// (`msg_set_pos`, which this codebase already renders) instead of being captured and
+    /// replayed. Such an error is therefore still shown; what is lost is that it can land in a
+    /// scrolled message area the user has to dismiss, which is the ergonomic the capture exists
+    /// to avoid. A host whose config externalises messages never sees that prompt anyway, because
+    /// its own handler takes the message first.
+    pub startup_message_capture: bool,
 }
 
 impl Default for LiveHarnessOptions {
@@ -131,6 +169,7 @@ impl Default for LiveHarnessOptions {
             cwd: None,
             extra_nvim_args: Vec::new(),
             child_env: Vec::new(),
+            startup_message_capture: true,
         }
     }
 }
@@ -208,6 +247,17 @@ impl ApplicationHandler<EventPayload> for RouteEventHandler {
 /// Every type this touches — [`DrawCommandResult`], [`StartupMessageFlush`], [`ParallelCommand`],
 /// [`send_ui`] — is already `pub`, so this is a small, self-contained duplication of already-
 /// public-surface logic, not a change to `window_wrapper.rs` itself, which stays untouched.
+///
+/// Note that this function still runs when a host sets
+/// [`LiveHarnessOptions::startup_message_capture`] to `false`, and that is correct rather than an
+/// oversight: `editor::Editor::set_ui_ready` arms the flush on the first real grid event whether
+/// or not the capture was ever enabled, so `DrawCommand::UIReady` — the same command that carries
+/// `should_show`, which is how a host learns it is safe to reveal its surface — always arrives
+/// paired with a `StartupMessageFlush::RestoreMessageUi`. With the capture off that flush is a
+/// no-op round trip (nothing was externalized to restore, no messages were held to replay, and
+/// `restore_builtin_message_ui` writes `cmdheight` back to the value it just read), which is
+/// exactly what the real binary does under `--no-startup-message-capture`. Suppressing it here
+/// would suppress `should_show` with it.
 fn flush_startup_messages_if_ready(result: &mut DrawCommandResult, neovim_handler: &NeovimHandler) {
     let Some(flush) = result.startup_message_flush.take() else {
         return;
@@ -280,8 +330,14 @@ impl LiveHarness {
     /// the baseline verified it for its own example: see `examples/live_harness_offscreen.rs` and
     /// this phase's report.
     pub fn with_options(options: LiveHarnessOptions) -> Result<Self> {
-        let LiveHarnessOptions { os_scale_factor, grid_size, cwd, extra_nvim_args, child_env } =
-            options;
+        let LiveHarnessOptions {
+            os_scale_factor,
+            grid_size,
+            cwd,
+            extra_nvim_args,
+            child_env,
+            startup_message_capture,
+        } = options;
 
         let event_loop = create_event_loop();
         let proxy = event_loop.create_proxy();
@@ -298,8 +354,11 @@ impl LiveHarness {
         // third: `CmdLineSettings::default()` (== `Self::parse_from(iter::empty::<String>())`,
         // used identically by `DemoHarness::new`) when there is nothing to pass through, or the
         // same `argv0, "--", ...` passthrough shape `examples/embedded_nvim_smoke.rs` used when
-        // there is. Deliberately does *not* pass `--no-startup-message-capture` — see this
-        // module's own doc on `flush_startup_messages_if_ready`.
+        // there is. Deliberately does *not* pass `--no-startup-message-capture`: the capture is on
+        // by default here as it is for the real binary, and a host that wants it off says so
+        // through `LiveHarnessOptions::startup_message_capture` (assigned below) rather than by
+        // this module deciding for every host — see this module's own doc on
+        // `flush_startup_messages_if_ready` and that field's own doc.
         let mut cmdline_settings = if extra_nvim_args.is_empty() {
             CmdLineSettings::default()
         } else {
@@ -312,6 +371,14 @@ impl LiveHarness {
         // one `LiveHarness`, so the injection can never reach another harness, the host process,
         // or any other subprocess the host spawns.
         cmdline_settings.child_env = child_env;
+        // Same reasoning, one layer up: `--no-startup-message-capture` *does* have an argv
+        // spelling, but folding it into the passthrough above would mean synthesizing a flag
+        // string for a boolean the caller already handed us, and would only work on the branch
+        // that has extra nvim args to pass. Assigned directly instead, against the same
+        // per-`LiveHarness` `Settings` instance `child_env` uses, so a host opting out here can
+        // never affect another harness or the host process. `true` (the `LiveHarnessOptions`
+        // default) leaves this exactly as `CmdLineSettings::default()` already had it.
+        cmdline_settings.startup_message_capture = startup_message_capture;
         settings.set(&cmdline_settings);
 
         // Needs the `EventLoop` for the Wayland/X11 display handle even though no window exists —
@@ -680,5 +747,30 @@ impl Drop for LiveHarness {
         if !self.shut_down {
             self.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one thing about this field that is worth a compiler-checked guard: its default must
+    /// stay `true`, so adding it changed nothing for any existing host. A host that wants the
+    /// capture off has to say so, and the blast radius of getting this backwards is every
+    /// `LiveHarness` user silently losing startup-error capture.
+    #[test]
+    fn startup_message_capture_defaults_to_on() {
+        assert!(LiveHarnessOptions::default().startup_message_capture);
+    }
+
+    /// `CmdLineSettings::default()` is where `with_options` starts from before assigning the
+    /// field, so the two defaults agreeing is what makes "`true` leaves everything exactly as it
+    /// was" true rather than merely intended.
+    #[test]
+    fn the_default_matches_cmdline_settings_own_default() {
+        assert_eq!(
+            LiveHarnessOptions::default().startup_message_capture,
+            CmdLineSettings::default().startup_message_capture
+        );
     }
 }
