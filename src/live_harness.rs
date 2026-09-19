@@ -303,6 +303,9 @@ pub struct LiveHarness {
     /// focus on every event does not re-fire nvim's `FocusGained`/`FocusLost` autocmds each time.
     /// `None` until the first call, so the host's first report always goes through.
     last_focus: Option<bool>,
+    /// The same `Settings` nvim's `setting_changed` notifications update, kept so a host can read
+    /// a `g:neovide_*` value it acts on itself ([`fullscreen_setting`](Self::fullscreen_setting)).
+    settings: Arc<Settings>,
 }
 
 /// Whether a focus report is a change worth sending on. Split out of
@@ -416,7 +419,7 @@ impl LiveHarness {
             )
             .context("NeovimRuntime::launch failed — is `nvim` (>= 0.10) on $PATH?")?;
 
-        let renderer = Renderer::new(os_scale_factor, config, settings);
+        let renderer = Renderer::new(os_scale_factor, config, settings.clone());
 
         Ok(LiveHarness {
             event_loop,
@@ -433,6 +436,7 @@ impl LiveHarness {
             clipboard: Some(clipboard),
             shut_down: false,
             last_focus: None,
+            settings,
         })
     }
 
@@ -696,6 +700,29 @@ impl LiveHarness {
         self.state.renderer.handle_event(&WindowEvent::Focused(focused));
         let command = if focused { ParallelCommand::FocusGained } else { ParallelCommand::FocusLost };
         send_ui(command, &self.neovim_handler);
+    }
+
+    /// `g:neovide_fullscreen` as this session's settings last received it (neovibe). This harness
+    /// has no window, so nothing here acts on it: the host owns the real window and reads this to
+    /// follow the variable. It changes when nvim assigns the variable (a `:let`, a mapping, an
+    /// `init.lua` line) and Neovide's watcher reports it, and it starts at a value `init.lua` set
+    /// before `ui_attach` if there was one. Cheap: one clone of a small settings struct.
+    pub fn fullscreen_setting(&self) -> bool {
+        self.settings.get::<WindowSettings>().fullscreen
+    }
+
+    /// Sets `g:neovide_fullscreen` in nvim (neovibe). For a host whose window changed fullscreen
+    /// state for a reason nvim did not see -- its own key, the compositor -- so the variable keeps
+    /// matching the window. Asynchronous: [`fullscreen_setting`](Self::fullscreen_setting) follows
+    /// once nvim's watcher reports the assignment back, like any other `:let`.
+    pub fn set_fullscreen_setting(&self, fullscreen: bool) {
+        send_ui(
+            ParallelCommand::SetGlobalVariable {
+                name: "neovide_fullscreen".to_string(),
+                value: fullscreen.into(),
+            },
+            &self.neovim_handler,
+        );
     }
 
     /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own

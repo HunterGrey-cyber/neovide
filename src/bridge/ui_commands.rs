@@ -281,6 +281,11 @@ pub enum ParallelCommand {
     SetBackground { background: String },
     FlushStartupMessages { messages: Vec<StartupMessage> },
     ReplayStartupMessages { messages: Vec<StartupMessage> },
+    /// `nvim_set_var(name, value)` (neovibe). An embedding host that owns window state nvim also
+    /// has a `g:neovide_*` setting for -- fullscreen -- writes the variable back when the window
+    /// changes for a reason nvim did not see, so the variable keeps telling the truth. Setting a
+    /// watched variable goes through Neovide's own `setting_changed` path like any `:let`.
+    SetGlobalVariable { name: String, value: Value },
 }
 
 async fn display_available_fonts(
@@ -466,6 +471,9 @@ impl ParallelCommand {
             }
             ParallelCommand::ReplayStartupMessages { messages } => {
                 replay_startup_messages(nvim, messages).await
+            }
+            ParallelCommand::SetGlobalVariable { name, value } => {
+                nvim.set_var(&name, value).await.context("SetGlobalVariable failed")
             }
         };
 
