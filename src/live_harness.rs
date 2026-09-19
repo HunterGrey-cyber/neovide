@@ -676,9 +676,10 @@ impl LiveHarness {
     /// window gets, and it reaches both halves that a real window's focus change reaches:
     ///
     /// - the renderer, whose cursor renderer draws a `Block` cursor as a hollow outline while
-    ///   unfocused (`cursor_renderer::CursorRenderer::draw`, `unfocused_outline_width`). This is
-    ///   the reason it exists (neovibe): the host shows which pane has the keys through the cursor
-    ///   itself, the way terminals do, rather than drawing a frame around the pane.
+    ///   unfocused (`cursor_renderer::CursorRenderer::draw`, `unfocused_outline_width`), or no
+    ///   cursor at all, of any shape, when that width is `<= 0`. This is the reason it exists
+    ///   (neovibe): the host shows which pane has the keys through the cursor itself rather than
+    ///   by drawing a frame around the pane; neovibe sets the width to 0 by default.
     /// - nvim, over `nvim_ui_set_focus` (`ParallelCommand::FocusGained`/`FocusLost`, exactly as
     ///   `WinitWindowWrapper::handle_focus_gained`/`handle_focus_lost` send them), which fires
     ///   nvim's own `FocusGained`/`FocusLost` autocmds.

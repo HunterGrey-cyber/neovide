@@ -394,6 +394,14 @@ impl CursorRenderer {
         if !(self.cursor.enabled && render) {
             return;
         }
+        // neovibe: an unfocused outline width of zero (or less) means "draw no cursor at all while
+        // unfocused", for every shape. It cannot be left to `draw_rectangular_outline`: its outer
+        // path uses pixel-snapped corners and its inner path the raw ones, so at width 0 the two
+        // differ by the rounding residual of a fractional cell size and the difference is a thin
+        // anti-aliased sliver, not an empty path (measured: 33 pixels at scale 1.5, 0 at 1.0).
+        if !self.window_has_focus && settings.unfocused_outline_width <= 0.0 {
+            return;
+        }
         // Draw Background
         let background_color = self
             .cursor
