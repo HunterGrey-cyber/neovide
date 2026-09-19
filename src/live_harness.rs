@@ -299,6 +299,16 @@ pub struct LiveHarness {
     // comment on why that ordering matters for Wayland).
     clipboard: Option<Arc<Mutex<Clipboard>>>,
     shut_down: bool,
+    /// The last focus state [`set_focused`](Self::set_focused) passed on, so a host that reports
+    /// focus on every event does not re-fire nvim's `FocusGained`/`FocusLost` autocmds each time.
+    /// `None` until the first call, so the host's first report always goes through.
+    last_focus: Option<bool>,
+}
+
+/// Whether a focus report is a change worth sending on. Split out of
+/// [`LiveHarness::set_focused`] because the harness itself needs a live nvim to construct.
+fn focus_changed(last: Option<bool>, now: bool) -> bool {
+    last != Some(now)
 }
 
 impl LiveHarness {
@@ -422,6 +432,7 @@ impl LiveHarness {
             runtime,
             clipboard: Some(clipboard),
             shut_down: false,
+            last_focus: None,
         })
     }
 
@@ -660,6 +671,32 @@ impl LiveHarness {
         );
     }
 
+    /// Tells Neovide that the host's keyboard focus moved onto (`true`) or off (`false`) this
+    /// surface. It is the embedded equivalent of the winit `WindowEvent::Focused` a real Neovide
+    /// window gets, and it reaches both halves that a real window's focus change reaches:
+    ///
+    /// - the renderer, whose cursor renderer draws a `Block` cursor as a hollow outline while
+    ///   unfocused (`cursor_renderer::CursorRenderer::draw`, `unfocused_outline_width`). This is
+    ///   the reason it exists (neovibe): the host shows which pane has the keys through the cursor
+    ///   itself, the way terminals do, rather than drawing a frame around the pane.
+    /// - nvim, over `nvim_ui_set_focus` (`ParallelCommand::FocusGained`/`FocusLost`, exactly as
+    ///   `WinitWindowWrapper::handle_focus_gained`/`handle_focus_lost` send them), which fires
+    ///   nvim's own `FocusGained`/`FocusLost` autocmds.
+    ///
+    /// Without a call the renderer keeps its constructed default (focused) and nvim hears
+    /// nothing, which is how every embedding behaved before this existed. Repeated reports of the
+    /// same state are dropped here, so a host may call this on every focus event it sees. The
+    /// cursor change shows on the next frame; the host still owns deciding when to draw one.
+    pub fn set_focused(&mut self, focused: bool) {
+        if !focus_changed(self.last_focus, focused) {
+            return;
+        }
+        self.last_focus = Some(focused);
+        self.state.renderer.handle_event(&WindowEvent::Focused(focused));
+        let command = if focused { ParallelCommand::FocusGained } else { ParallelCommand::FocusLost };
+        send_ui(command, &self.neovim_handler);
+    }
+
     /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own
     /// `window::window_wrapper::RouteWindow` exposes as a `pub` field, for anything beyond plain
     /// text input this harness's own API doesn't cover (arbitrary `nvim_command`/buffer
@@ -752,6 +789,16 @@ impl Drop for LiveHarness {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_first_focus_report_always_goes_through_and_repeats_are_dropped() {
+        assert!(super::focus_changed(None, true));
+        assert!(super::focus_changed(None, false));
+        assert!(!super::focus_changed(Some(true), true));
+        assert!(!super::focus_changed(Some(false), false));
+        assert!(super::focus_changed(Some(true), false));
+        assert!(super::focus_changed(Some(false), true));
+    }
+
     use super::*;
 
     /// The one thing about this field that is worth a compiler-checked guard: its default must
