@@ -303,9 +303,22 @@ pub struct LiveHarness {
     /// focus on every event does not re-fire nvim's `FocusGained`/`FocusLost` autocmds each time.
     /// `None` until the first call, so the host's first report always goes through.
     last_focus: Option<bool>,
+    /// The `g:neovide_scale_factor` the renderer was last synced to (neovibe). `None` until the
+    /// first frame, so whatever `init.lua` set before `ui_attach` is applied on that frame rather
+    /// than never. See [`apply_scale_factor_setting`](Self::apply_scale_factor_setting).
+    last_user_scale_factor: Option<f32>,
     /// The same `Settings` nvim's `setting_changed` notifications update, kept so a host can read
     /// a `g:neovide_*` value it acts on itself ([`fullscreen_setting`](Self::fullscreen_setting)).
     settings: Arc<Settings>,
+}
+
+/// Whether the renderer needs re-syncing to `g:neovide_scale_factor` (neovibe). Split out of
+/// [`LiveHarness::apply_scale_factor_setting`] for the same reason [`focus_changed`] is: the
+/// harness itself needs a live nvim to construct, and this is the one decision worth a test.
+/// Exact comparison is deliberate -- the value comes from nvim verbatim, so an unchanged
+/// variable compares equal bit for bit, and any assignment at all is worth one resync.
+fn scale_factor_changed(last: Option<f32>, current: f32) -> bool {
+    last != Some(current)
 }
 
 /// Whether a focus report is a change worth sending on. Split out of
@@ -436,6 +449,7 @@ impl LiveHarness {
             clipboard: Some(clipboard),
             shut_down: false,
             last_focus: None,
+            last_user_scale_factor: None,
             settings,
         })
     }
@@ -476,6 +490,7 @@ impl LiveHarness {
         dt: f32,
     ) -> bool {
         self.pump(NON_BLOCKING);
+        let scale_factor_changed = self.apply_scale_factor_setting();
 
         let renderer = &mut self.state.renderer;
         renderer.prepare_frame();
@@ -487,7 +502,17 @@ impl LiveHarness {
         });
 
         let animating = renderer.animate_frame(&grid_rect, dt);
-        renderer.prepare_lines(false);
+        // Standalone forces this same `prepare_lines(true)` on the frame `font_changed_last_frame`
+        // is set (`window_wrapper.rs`'s `prepare_frame`), and a scale change needs the same force
+        // here for the same reason: `prepare_lines(false)` only re-records a line whose picture is
+        // already invalid (a fresh `RenderedLine`, moved content, a moved boxchar) — it treats a
+        // still-`is_valid` line as nothing to do, and a scale change invalidates none of that, it
+        // just changes the cell size the *next* recording would use. Without forcing this, a line
+        // keeps its old-size glyph picture until nvim's own async resize round-trip marks it
+        // invalid some other way — and if the zoom step leaves the integer grid size unchanged (a
+        // plausible, even common, `Ctrl+=` step), no resize is ever sent, and the stale glyphs
+        // never get redrawn at all.
+        renderer.prepare_lines(scale_factor_changed);
         renderer.draw_frame(canvas, content_region, dt);
         animating
     }
@@ -725,6 +750,54 @@ impl LiveHarness {
         );
     }
 
+    /// `g:neovide_scale_factor` as this session's settings last received it (neovibe) -- Neovide's
+    /// own zoom. Unlike [`fullscreen_setting`](Self::fullscreen_setting) this one is not merely
+    /// reported: [`render_frame`](Self::render_frame) applies it to the renderer itself (see
+    /// [`apply_scale_factor_setting`](Self::apply_scale_factor_setting)). A host reads it to scale
+    /// anything of its own alongside the editor.
+    pub fn scale_factor_setting(&self) -> f32 {
+        self.settings.get::<WindowSettings>().scale_factor
+    }
+
+    /// Sets `g:neovide_scale_factor` in nvim (neovibe), for a host that zooms from a key nvim never
+    /// sees. Asynchronous, like [`set_fullscreen_setting`](Self::set_fullscreen_setting): the
+    /// renderer follows once nvim's watcher reports the assignment back, so a `:let` typed by hand
+    /// and this call take exactly the same path.
+    pub fn set_scale_factor_setting(&self, scale_factor: f32) {
+        send_ui(
+            ParallelCommand::SetGlobalVariable {
+                name: "neovide_scale_factor".to_string(),
+                value: (scale_factor as f64).into(),
+            },
+            &self.neovim_handler,
+        );
+    }
+
+    /// Re-syncs the renderer to `g:neovide_scale_factor` when it changed (neovibe). Returns
+    /// whether it did, so [`render_frame`](Self::render_frame) can force the redraw a scale change
+    /// needs (see that call site's own comment for why).
+    ///
+    /// Standalone Neovide does this from `window_wrapper.rs` -- once at window creation
+    /// (`sync_scale_factor`) and live from its settings-change handling
+    /// (`handle_user_scale_factor_change`). An embedding never goes through that file, so before
+    /// this the variable was stored and never applied: **assigning it inside an embedded session
+    /// changed nothing on screen at all.** Calling it here, per frame, is cheap -- one clone of a
+    /// small settings struct and a float comparison -- and the host's own per-tick grid re-derive
+    /// (which reads [`grid_scale`](Self::grid_scale) live) picks the new cell size up on the next
+    /// tick and resizes nvim's grid to match, so nothing else needs to know a zoom happened.
+    ///
+    /// `os_scale_factor` is left exactly as the host set it; `sync_scale_factor` multiplies the two,
+    /// so HiDPI is preserved.
+    fn apply_scale_factor_setting(&mut self) -> bool {
+        let current = self.scale_factor_setting();
+        if !scale_factor_changed(self.last_user_scale_factor, current) {
+            return false;
+        }
+        self.last_user_scale_factor = Some(current);
+        self.state.renderer.sync_scale_factor();
+        true
+    }
+
     /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own
     /// `window::window_wrapper::RouteWindow` exposes as a `pub` field, for anything beyond plain
     /// text input this harness's own API doesn't cover (arbitrary `nvim_command`/buffer
@@ -825,6 +898,18 @@ mod tests {
         assert!(!super::focus_changed(Some(false), false));
         assert!(super::focus_changed(Some(true), false));
         assert!(super::focus_changed(Some(false), true));
+    }
+
+    /// The first frame always applies whatever the variable holds -- which is how an `init.lua`
+    /// that set `g:neovide_scale_factor` before `ui_attach` takes effect at all -- and an
+    /// unchanged variable costs no resync after that.
+    #[test]
+    fn the_scale_factor_is_applied_on_the_first_frame_and_then_only_on_change() {
+        assert!(super::scale_factor_changed(None, 1.0));
+        assert!(super::scale_factor_changed(None, 1.2));
+        assert!(!super::scale_factor_changed(Some(1.0), 1.0));
+        assert!(super::scale_factor_changed(Some(1.0), 1.1));
+        assert!(super::scale_factor_changed(Some(1.1), 1.0));
     }
 
     use super::*;
