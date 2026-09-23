@@ -307,6 +307,14 @@ pub struct LiveHarness {
     /// first frame, so whatever `init.lua` set before `ui_attach` is applied on that frame rather
     /// than never. See [`apply_scale_factor_setting`](Self::apply_scale_factor_setting).
     last_user_scale_factor: Option<f32>,
+    /// Diagnostics (neovibe): how many times
+    /// [`apply_scale_factor_setting`](Self::apply_scale_factor_setting) has actually resynced the
+    /// renderer, i.e. how many times [`scale_factor_changed`] returned `true`. Exposed via
+    /// [`scale_factor_resyncs`](Self::scale_factor_resyncs) so a test (or a host) can tell "the
+    /// change gate fired N times" apart from "the renderer resyncs on every frame regardless" --
+    /// the latter is exactly the P11-class idle-cost regression removing the gate in
+    /// [`render_frame`](Self::render_frame) would reintroduce.
+    scale_factor_resyncs: u64,
     /// The same `Settings` nvim's `setting_changed` notifications update, kept so a host can read
     /// a `g:neovide_*` value it acts on itself ([`fullscreen_setting`](Self::fullscreen_setting)).
     settings: Arc<Settings>,
@@ -450,6 +458,7 @@ impl LiveHarness {
             shut_down: false,
             last_focus: None,
             last_user_scale_factor: None,
+            scale_factor_resyncs: 0,
             settings,
         })
     }
@@ -795,7 +804,16 @@ impl LiveHarness {
         }
         self.last_user_scale_factor = Some(current);
         self.state.renderer.sync_scale_factor();
+        self.scale_factor_resyncs += 1;
         true
+    }
+
+    /// Diagnostics (neovibe): how many times [`apply_scale_factor_setting`] has actually resynced
+    /// the renderer since construction -- not how many frames have been rendered, and not how many
+    /// times `g:neovide_scale_factor` has been read. A test can hold this to "does not move across
+    /// N idle frames" to prove the change gate, not just its absence of a crash, is still there.
+    pub fn scale_factor_resyncs(&self) -> u64 {
+        self.scale_factor_resyncs
     }
 
     /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own
