@@ -315,6 +315,23 @@ pub struct LiveHarness {
     /// the latter is exactly the P11-class idle-cost regression removing the gate in
     /// [`render_frame`](Self::render_frame) would reintroduce.
     scale_factor_resyncs: u64,
+    /// Set by [`set_os_scale_factor`](Self::set_os_scale_factor) when it actually changes the
+    /// renderer's OS scale, and taken (reset to `false`) by the next
+    /// [`render_frame`](Self::render_frame) call, which folds it into that frame's forced-redraw
+    /// decision (neovibe, v1 P2). Mirrors [`last_user_scale_factor`]'s role for the *user*-scale
+    /// side of the same product (`os_scale_factor * user_scale_factor`,
+    /// `Renderer::update_scale_factor`) -- kept as a separate flag rather than reusing
+    /// `last_user_scale_factor`'s comparison because the two vary independently and a host may
+    /// call `set_os_scale_factor` on a frame where nvim's own `g:neovide_scale_factor` did not
+    /// move at all.
+    os_scale_redraw_pending: bool,
+    /// Diagnostics (neovibe, v1 P2): how many times
+    /// [`set_os_scale_factor`](Self::set_os_scale_factor) has actually changed the renderer's OS
+    /// scale since construction. Exposed via
+    /// [`os_scale_factor_resyncs`](Self::os_scale_factor_resyncs) for the same reason
+    /// [`scale_factor_resyncs`] is: a test (or a host) can hold this to "does not move across N
+    /// idle frames" to prove the change gate, not just the absence of a crash, is still there.
+    os_scale_factor_resyncs: u64,
     /// The same `Settings` nvim's `setting_changed` notifications update, kept so a host can read
     /// a `g:neovide_*` value it acts on itself ([`fullscreen_setting`](Self::fullscreen_setting)).
     settings: Arc<Settings>,
@@ -459,6 +476,8 @@ impl LiveHarness {
             last_focus: None,
             last_user_scale_factor: None,
             scale_factor_resyncs: 0,
+            os_scale_redraw_pending: false,
+            os_scale_factor_resyncs: 0,
             settings,
         })
     }
@@ -499,7 +518,14 @@ impl LiveHarness {
         dt: f32,
     ) -> bool {
         self.pump(NON_BLOCKING);
-        let scale_factor_changed = self.apply_scale_factor_setting();
+        // Non-short-circuit `|` (not `||`): both sides must run every frame regardless of the
+        // other's result. `apply_scale_factor_setting`'s own resync counter (P11's idle-cost
+        // signal) must keep incrementing on its own terms even on a frame an OS-scale change also
+        // forces, and conversely `std::mem::take` must always run to actually clear the pending
+        // flag -- short-circuiting either would silently stop counting or leave a stale `true`
+        // pending forever once the other side is also `true` on the same frame (neovibe, v1 P2).
+        let scale_factor_changed =
+            self.apply_scale_factor_setting() | std::mem::take(&mut self.os_scale_redraw_pending);
 
         let renderer = &mut self.state.renderer;
         renderer.prepare_frame();
@@ -520,7 +546,10 @@ impl LiveHarness {
         // keeps its old-size glyph picture until nvim's own async resize round-trip marks it
         // invalid some other way — and if the zoom step leaves the integer grid size unchanged (a
         // plausible, even common, `Ctrl+=` step), no resize is ever sent, and the stale glyphs
-        // never get redrawn at all.
+        // never get redrawn at all. An OS-scale change (`set_os_scale_factor`, neovibe v1 P2)
+        // leaves the integer grid unchanged by construction too -- the logical widget size did not
+        // move, only the cell size did -- so it needs exactly the same forced redraw, and
+        // `os_scale_redraw_pending` folds into this same flag for that reason.
         renderer.prepare_lines(scale_factor_changed);
         renderer.draw_frame(canvas, content_region, dt);
         animating
@@ -814,6 +843,63 @@ impl LiveHarness {
     /// N idle frames" to prove the change gate, not just its absence of a crash, is still there.
     pub fn scale_factor_resyncs(&self) -> u64 {
         self.scale_factor_resyncs
+    }
+
+    /// The OS/display scale the renderer rasterizes at (neovibe, v1 P2) -- as last set by
+    /// [`set_os_scale_factor`](Self::set_os_scale_factor), or the value passed to
+    /// [`with_options`](Self::with_options)/[`new`](Self::new) if it never has been. Distinct from
+    /// [`scale_factor_setting`](Self::scale_factor_setting), which is nvim's own
+    /// `g:neovide_scale_factor` (the *user* zoom); the renderer's actual cell size is their
+    /// product (`renderer::Renderer`'s private `update_scale_factor`).
+    pub fn os_scale_factor(&self) -> f64 {
+        self.state.renderer.os_scale_factor
+    }
+
+    /// Re-rasterizes at a new OS/display scale (neovibe, v1 P2): the counterpart to
+    /// [`apply_scale_factor_setting`](Self::apply_scale_factor_setting) for the *other* half of
+    /// the scale-factor product. Standalone Neovide reaches the equivalent renderer call
+    /// (`Renderer::handle_os_scale_factor_change`) from `window_wrapper.rs`'s
+    /// `handle_scale_factor_update`, itself driven by winit's own `ScaleFactorChanged` event -- a
+    /// path an embedding never runs, because there is no winit-owned `Window` here for that event
+    /// to arrive on. Before this method existed, `os_scale_factor` was read exactly once, at
+    /// construction (`with_options` -> `Renderer::new`), and had **no way to change afterward**:
+    /// `state` is private, so a host that later observed a different OS scale (a window dragged
+    /// onto another monitor, GTK's `notify::scale-factor`) had no call to make the renderer follow
+    /// it. This is exactly that call. As with `apply_scale_factor_setting`, the host owns
+    /// re-deriving nvim's own grid size afterward -- this only moves the renderer's idea of the
+    /// cell size, and deliberately leaves the *integer* grid exactly as it was (see
+    /// [`render_frame`](Self::render_frame)'s own comment on why that same-size case still needs
+    /// a forced redraw).
+    ///
+    /// Returns `true` only when the value actually changed and was applied (compared by bits,
+    /// exactly like [`scale_factor_changed`]): a non-finite or non-positive value (`NaN`, `0.0`,
+    /// or a negative) is rejected outright with no effect at all, and reassigning the value
+    /// already in force is a no-op -- both by construction, so a host's own
+    /// `notify::scale-factor` handler can call this unconditionally on every signal with no
+    /// idle-cost concern of its own (P11). A `true` return leaves a pending flag set for the
+    /// *next* [`render_frame`](Self::render_frame) call rather than forcing the redraw here --
+    /// see that call site's own comment for why the two must land on the same frame the
+    /// framebuffer itself changes, never before it.
+    pub fn set_os_scale_factor(&mut self, os_scale_factor: f64) -> bool {
+        if !os_scale_factor.is_finite() || os_scale_factor <= 0.0 {
+            return false;
+        }
+        if os_scale_factor.to_bits() == self.state.renderer.os_scale_factor.to_bits() {
+            return false;
+        }
+        self.state.renderer.handle_os_scale_factor_change(os_scale_factor);
+        self.os_scale_redraw_pending = true;
+        self.os_scale_factor_resyncs += 1;
+        true
+    }
+
+    /// Diagnostics (neovibe, v1 P2): how many times
+    /// [`set_os_scale_factor`](Self::set_os_scale_factor) has actually changed the renderer's OS
+    /// scale since construction -- the same shape as [`scale_factor_resyncs`] for the user-scale
+    /// side, and for the same reason: a test (or a host) can hold this to "does not move across N
+    /// idle frames" to prove the change gate, not just the absence of a crash, is still there.
+    pub fn os_scale_factor_resyncs(&self) -> u64 {
+        self.os_scale_factor_resyncs
     }
 
     /// A clone of the underlying [`NeovimHandler`] — the same escape hatch real Neovide's own
