@@ -10,7 +10,8 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex},
-    task::{Context as TaskContext, Poll},
+    task::{Context as TaskContext, Poll, Waker},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -51,9 +52,21 @@ impl HangUp {
         HangUpWriter(self.0.clone())
     }
 
-    /// Closes nvim's stdin. Idempotent.
+    /// Closes nvim's stdin. Idempotent. A pipe closes when it is dropped; a socket
+    /// (`NEOVIDE_SERVER`) is shut for writing first, since its read half keeps it open and the
+    /// server would otherwise never see this client leave.
     pub fn hang_up(&self) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let writer = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(mut writer) = writer else { return };
+        // Shutting a socket's write side is immediate, but a split stream's write half may briefly
+        // find the read half holding their shared lock: try again for a few milliseconds.
+        let mut cx = TaskContext::from_waker(Waker::noop());
+        for _ in 0..50 {
+            if Pin::new(&mut writer).poll_shutdown(&mut cx).is_ready() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -144,6 +157,11 @@ impl NeovimSession {
         .await;
         match handshake_res {
             Err(err) => {
+                // Let the process go before waiting for its stderr to end: a launcher that closed
+                // its stdout and waits for EOF on its stdin would otherwise never exit, and startup
+                // would never report this error (neovibe; `HangUp` holds the writer the handshake
+                // used to drop).
+                hang_up.hang_up();
                 if let Some(stderr_task) = stderr_task {
                     let stderr = "stderr output:\n".to_owned() + &stderr_task.await?.join("\n");
                     Err(err).context(stderr)
