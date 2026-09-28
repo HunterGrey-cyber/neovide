@@ -25,11 +25,15 @@
 //!   already uses internally for real sessions, and the one `DemoHarness` already uses for
 //!   fabricated content;
 //! - [`bridge::send_ui`] + [`bridge::SerialCommand::Keyboard`] to forward keyboard input, and
-//!   [`bridge::ParallelCommand::Quit`] + [`crate::bridge::NeovimRuntime::shutdown_timeout`] for
-//!   shutdown — both confirmed end-to-end by the baseline phase and by
-//!   `examples/embedded_nvim_smoke.rs`, including that baseline's concretely-reproduced orphaned-
-//!   process failure mode and its fix (forcing `WindowSettings::confirm_quit` to `false` — see
-//!   [`LiveHarness::with_options`]'s doc).
+//!   closing nvim's stdin ([`bridge::NeovimRuntime::hang_up_neovim`]) +
+//!   [`crate::bridge::NeovimRuntime::shutdown_timeout`] for shutdown. **This harness never sends
+//!   nvim `:qa!`** (neovibe, 2026-09-27, a recorded exception to the fork's surface-only scope):
+//!   the baseline's shutdown sent [`bridge::ParallelCommand::Quit`] with `confirm_quit` forced
+//!   off, which is `:qa!` -- unsaved buffers discarded AND their swap files deleted, and, arriving
+//!   while nvim showed a `:confirm qall` dialog, run nested inside it. On EOF nvim exits keeping
+//!   the swap files of modified buffers instead; one that does not (a dialog is up) is the host's
+//!   to end by pid, since only the host knows it. [`bridge::NEVER_FORCE_QUIT`] makes the one
+//!   `Quit` nvim itself can still trigger here (`<D-q>`, from `lua/init.lua`) ask first.
 //!
 //! One thing this module does that the baseline's own smoke test deliberately sidestepped: it
 //! reproduces `window_wrapper.rs`'s private `flush_startup_messages_if_ready` (see the free
@@ -78,9 +82,9 @@ use crate::{
 /// main loop) needs exactly that — nothing on that thread may block synchronously for long.
 const NON_BLOCKING: Duration = Duration::ZERO;
 
-/// How long [`LiveHarness::shutdown`] waits for a real `UserEvent::NeovimExited` after asking
-/// nvim to quit, before giving up and force-tearing-down the tokio runtime anyway. See that
-/// method's own doc for what "giving up" means in practice.
+/// How long [`LiveHarness::shutdown`] waits for a real `UserEvent::NeovimExited` after closing
+/// nvim's stdin, before giving up and tearing down the tokio runtime anyway. See that method's own
+/// doc for what "giving up" means in practice.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 /// Configuration for [`LiveHarness::with_options`]. [`LiveHarness::new`] is shorthand for
@@ -369,17 +373,11 @@ impl LiveHarness {
     ///
     /// Registers the same `SettingGroup`s [`crate::demo_harness::DemoHarness::new`] and the
     /// baseline's own smoke test register (`Renderer::new`/`NeovimRuntime::launch` both panic via
-    /// `Settings::get` on an unregistered/unset type otherwise), with one deliberate override:
-    /// `WindowSettings::confirm_quit` is forced to `false` unconditionally. The baseline report
-    /// found, and reproduced concretely (a real orphaned `nvim --embed` process, reparented to
-    /// init, confirmed via `ps`), that leaving this at its `true` default makes nvim's own quit
-    /// path run `:confirm qa` instead of `:qa!` — which blocks forever on an interactive save
-    /// prompt nothing here ever answers, and this codebase has **no force-kill fallback** for a
-    /// child stuck like that (see [`LiveHarness::shutdown`]'s own doc for the full detail, still
-    /// true here). Forcing this override is what makes that fallback-free shutdown path actually
-    /// reliable rather than merely hoped-for — empirically verified for this module the same way
-    /// the baseline verified it for its own example: see `examples/live_harness_offscreen.rs` and
-    /// this phase's report.
+    /// `Settings::get` on an unregistered/unset type otherwise). `WindowSettings::confirm_quit` is
+    /// left at its `true` default (neovibe, 2026-09-27). The baseline forced it to `false` so that
+    /// its shutdown's `Quit` ran `:qa!` rather than a `:confirm qa` nothing here answers; the
+    /// shutdown sends no `Quit` any more (see [`LiveHarness::shutdown`]), and
+    /// [`bridge::NEVER_FORCE_QUIT`], set here, makes any other `Quit` confirm.
     pub fn with_options(options: LiveHarnessOptions) -> Result<Self> {
         let LiveHarnessOptions {
             os_scale_factor,
@@ -399,7 +397,8 @@ impl LiveHarness {
         settings.register::<CursorSettings>();
         settings.register::<ProgressBarSettings>();
 
-        settings.set(&WindowSettings { confirm_quit: false, ..Default::default() });
+        settings.set(&WindowSettings { confirm_quit: true, ..Default::default() });
+        crate::bridge::NEVER_FORCE_QUIT.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Mirrors the two established patterns already in this codebase rather than inventing a
         // third: `CmdLineSettings::default()` (== `Self::parse_from(iter::empty::<String>())`,
@@ -932,9 +931,18 @@ impl LiveHarness {
         self.state.neovim_exited
     }
 
-    /// Cleanly shuts down the real nvim connection: sends `ParallelCommand::Quit` (the exact
-    /// mechanism confirmed by the baseline report — `nvim.exec_lua(.., [is_remote])` running
-    /// `:qa!`, given the `confirm_quit` override [`with_options`](Self::with_options) applies),
+    /// Closes nvim's stdin (neovibe, 2026-09-27): nvim exits on EOF, keeping the swap files of its
+    /// modified buffers. Never `:qa!`. An nvim that does not exit on EOF -- a `:confirm` dialog is
+    /// up, or it is busy in an external command -- is the host's to end: this harness does not know
+    /// its pid (a `nvim` launcher may stand between). Idempotent; what arrives for nvim afterwards
+    /// fails with `BrokenPipe`.
+    pub fn hang_up(&mut self) {
+        self.runtime.hang_up_neovim();
+    }
+
+    /// Shuts down the real nvim connection: closes nvim's stdin ([`hang_up`](Self::hang_up); never
+    /// `:qa!`, neovibe 2026-09-27 -- until then this sent `ParallelCommand::Quit` with
+    /// `confirm_quit` forced off, which discarded unsaved buffers and deleted their swap files),
     /// waits up to 5s for the resulting `UserEvent::NeovimExited`, drops the clipboard while the
     /// event loop is still alive (mirroring `window::application::Application::teardown`'s own
     /// comment about releasing Wayland handles safely — see
@@ -943,28 +951,18 @@ impl LiveHarness {
     /// succeeded.
     ///
     /// Returns `true` if `NeovimExited` was actually observed before the 5s wait elapsed; `false`
-    /// otherwise. **Callers should check this.** The baseline report found, and reproduced
-    /// concretely (a real orphaned `nvim --embed` process, reparented to init, confirmed via
-    /// `ps`), that nothing in this codebase force-kills a stuck child: dropping a
-    /// `tokio::process::Child` does not kill the OS process, and neither
-    /// `NeovimRuntime::shutdown_timeout` nor its own `Drop` impl reach far enough to do so — the
-    /// child PID isn't even exposed back to `bridge::NeovimRuntime::launch`'s own caller, this
-    /// module included. The `confirm_quit` override closes the one concrete way this was
-    /// reproduced (an unanswered `:confirm qa` save prompt), but anything else that blocks nvim's
-    /// own `:qa!` (a slow `BufWritePre` autocommand, a hung plugin, ...) has the same effect, and
-    /// this method's return value is your only signal that happened — there is currently no API
-    /// anywhere in this codebase to hard-kill the child yourself if it does. A later, genuinely
-    /// interactive phase should track the child PID independently for its own safety net, exactly
-    /// as the baseline report's own judgment call #4 flagged.
+    /// otherwise. **Callers should check this**: nothing here kills a child that did not exit on
+    /// EOF (dropping a `tokio::process::Child` does not kill the OS process), and its pid is not
+    /// known here; a host that holds it ends it.
     ///
-    /// Idempotent: a second call returns `true` immediately, without re-sending `Quit`.
+    /// Idempotent: a second call returns `true` immediately.
     pub fn shutdown(&mut self) -> bool {
         if self.shut_down {
             return true;
         }
         self.shut_down = true;
 
-        send_ui(ParallelCommand::Quit, &self.neovim_handler);
+        self.hang_up();
 
         let deadline = Instant::now() + SHUTDOWN_WAIT;
         while !self.state.neovim_exited && Instant::now() < deadline {

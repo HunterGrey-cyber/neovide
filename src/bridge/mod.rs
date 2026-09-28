@@ -97,7 +97,15 @@ pub struct NeovimRuntime {
     pub runtime: Option<Runtime>,
     clipboard: ClipboardHandle,
     background_preference: Arc<Mutex<String>>,
+    /// The current session's stdin closer (neovibe; [`session::HangUp`]).
+    hang_up: Option<session::HangUp>,
 }
+
+/// Set by an embedding that must never have nvim force-quit (neovibe's `LiveHarness`): every
+/// [`ParallelCommand::Quit`] then runs `confirm qa` -- nvim asks about unsaved buffers -- whatever
+/// `g:neovide_confirm_quit` says. The `<D-q>` mapping `lua/init.lua` installs sends one.
+pub static NEVER_FORCE_QUIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 async fn neovim_instance(
     settings: &Settings,
@@ -384,6 +392,7 @@ impl NeovimRuntime {
             runtime: Some(runtime),
             clipboard,
             background_preference: Arc::new(Mutex::new("dark".to_string())),
+            hang_up: None,
         })
     }
 
@@ -440,6 +449,7 @@ impl NeovimRuntime {
             editor_handler.clone(),
         ));
 
+        self.hang_up = Some(session.hang_up.clone());
         self.runtime().spawn(run(route_id, session, event_loop_proxy));
 
         Ok(editor_handler)
@@ -472,9 +482,18 @@ impl NeovimRuntime {
             OpenMode::None,
         ))?;
 
+        self.hang_up = Some(session.hang_up.clone());
         self.runtime().spawn(run(route_id, session, event_loop_proxy));
 
         Ok(())
+    }
+
+    /// Closes the current nvim's stdin: nvim exits on EOF, keeping its swap files (neovibe;
+    /// [`session::HangUp`]). Idempotent; nothing before a session was launched.
+    pub fn hang_up_neovim(&self) {
+        if let Some(hang_up) = &self.hang_up {
+            hang_up.hang_up();
+        }
     }
 
     fn runtime(&self) -> &Runtime {

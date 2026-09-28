@@ -420,10 +420,12 @@ impl ParallelCommand {
             ParallelCommand::Quit => {
                 // Ignore all errors, since neovim exits immediately before the response is sent.
                 // We could an RPC notify instead of request, but nvim-rs does currently not support it.
+                let never_force =
+                    crate::bridge::NEVER_FORCE_QUIT.load(std::sync::atomic::Ordering::Relaxed);
                 let _ = nvim
                     .exec_lua(
                         include_str!("../../lua/exit_handler.lua"),
-                        call_args![settings.get::<CmdLineSettings>().server.is_some()],
+                        call_args![settings.get::<CmdLineSettings>().server.is_some(), never_force],
                     )
                     .await;
                 Ok(())

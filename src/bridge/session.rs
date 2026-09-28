@@ -6,8 +6,11 @@ use core::fmt;
 #[cfg(target_os = "windows")]
 use std::process::Child;
 use std::{
-    io::{Error, Result},
+    io::{Error, ErrorKind, Result},
+    pin::Pin,
     process::Stdio,
+    sync::{Arc, Mutex},
+    task::{Context as TaskContext, Poll},
 };
 
 use anyhow::Context;
@@ -28,8 +31,70 @@ pub type NeovimWriter = Box<dyn futures::AsyncWrite + Send + Unpin + 'static>;
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin + 'static>;
 type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin + 'static>;
 
+/// Closes nvim's stdin while every clone of the connection still holds its writer (neovibe).
+///
+/// An embedding ends nvim without ever sending it `:qa!`: closing its stdin makes nvim exit on EOF
+/// keeping the swap files of modified buffers (`preserve_exit`), where `:qa!` deletes them. The
+/// writer nvim-rs holds is shared by every clone of the `Neovim` handle, so dropping handles cannot
+/// close it; this owns the real writer and hands nvim-rs a proxy, so [`HangUp::hang_up`] can drop
+/// the real one -- closing the pipe -- whatever still holds the proxy. Writes after it fail with
+/// `BrokenPipe`.
+#[derive(Clone)]
+pub struct HangUp(Arc<Mutex<Option<BoxedWriter>>>);
+
+impl HangUp {
+    fn new(writer: BoxedWriter) -> Self {
+        Self(Arc::new(Mutex::new(Some(writer))))
+    }
+
+    fn writer(&self) -> HangUpWriter {
+        HangUpWriter(self.0.clone())
+    }
+
+    /// Closes nvim's stdin. Idempotent.
+    pub fn hang_up(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
+struct HangUpWriter(Arc<Mutex<Option<BoxedWriter>>>);
+
+impl HangUpWriter {
+    fn with<T>(
+        &self,
+        f: impl FnOnce(Pin<&mut BoxedWriter>) -> Poll<Result<T>>,
+        hung_up: impl FnOnce() -> Poll<Result<T>>,
+    ) -> Poll<Result<T>> {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(writer) => f(Pin::new(writer)),
+            None => hung_up(),
+        }
+    }
+}
+
+impl AsyncWrite for HangUpWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        self.with(|w| w.poll_write(cx, buf), || Poll::Ready(Err(ErrorKind::BrokenPipe.into())))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        self.with(|w| w.poll_flush(cx), || Poll::Ready(Err(ErrorKind::BrokenPipe.into())))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        self.with(|w| w.poll_shutdown(cx), || Poll::Ready(Ok(())))
+    }
+}
+
 pub struct NeovimSession {
     pub neovim: Neovim<NeovimWriter>,
+    /// Closes nvim's stdin (neovibe; [`HangUp`]).
+    pub hang_up: HangUp,
     pub io_handle: JoinHandle<std::result::Result<(), Box<LoopError>>>,
     pub neovim_process: Option<Child>,
     pub stderr_task: Option<JoinHandle<Vec<String>>>,
@@ -54,6 +119,8 @@ impl NeovimSession {
         #[cfg(not(target_os = "windows"))]
         let stdin_fd = instance.forward_stdin();
         let (reader, writer, stderr_reader, neovim_process) = instance.connect().await?;
+        let hang_up = HangUp::new(writer);
+        let writer = hang_up.writer();
         // Spawn a background task to read from stderr
         let stderr_task = stderr_reader.map(|reader| {
             tokio::spawn(async move {
@@ -89,6 +156,7 @@ impl NeovimSession {
 
                 Ok(Self {
                     neovim,
+                    hang_up,
                     io_handle,
                     neovim_process,
                     stderr_task,

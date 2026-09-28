@@ -6,7 +6,9 @@ local function quit(confirm)
     end
 end
 
-local function detach_handler(is_remote)
+-- `always_confirm` (neovibe): an embedding that must never force-quit nvim asks it instead.
+local function detach_handler(is_remote, always_confirm)
+    local confirm = always_confirm or vim.g.neovide_confirm_quit or false
     if is_remote then
         local detach = vim.g.neovide_detach_on_quit or "prompt"
         local c
@@ -21,10 +23,10 @@ local function detach_handler(is_remote)
         if c == 1 then
             vim.fn.chanclose(vim.g.neovide_channel_id)
         elseif c == 2 then
-            quit(vim.g.neovide_confirm_quit or false)
+            quit(confirm)
         end
     else
-        quit(vim.g.neovide_confirm_quit or false)
+        quit(confirm)
     end
 end
 return detach_handler(...)
