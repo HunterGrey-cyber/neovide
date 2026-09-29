@@ -492,6 +492,17 @@ impl LiveHarness {
         self.event_loop.pump_app_events(Some(timeout), &mut self.state);
     }
 
+    /// neovibe: the headless event loop's own fd (winit's calloop epoll fd), readable whenever an
+    /// `EventPayload` -- a redraw batch, a setting change, nvim's exit -- is waiting. A host that
+    /// registers it with its own main loop can call [`pump`](Self::pump) the moment one arrives
+    /// instead of on a timer (winit documents this use on `EventLoop`'s `AsFd`). The fd belongs
+    /// to this harness: stop watching it before the harness is dropped.
+    #[cfg(target_os = "linux")]
+    pub fn event_loop_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.event_loop.as_raw_fd()
+    }
+
     /// Advances animation state and paints one frame into `canvas` — the exact per-frame sequence
     /// `WinitWindowWrapper` runs (`prepare_frame`, `animate_frame`, `prepare_lines`, `draw_frame`)
     /// folded into one call, matching [`crate::demo_harness::DemoHarness::render_frame`]'s own
