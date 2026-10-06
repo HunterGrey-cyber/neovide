@@ -283,6 +283,11 @@ impl MouseManager {
                 return MessageSelectionEvent::Outside;
             }
 
+            // The strip an embedding application reserves at the right edge is not the editor's.
+            if crate::embed::pointer_in_reserved(f64::from(position.x)) {
+                return MessageSelectionEvent::Outside;
+            }
+
             self.get_window_details_under_mouse(editor_state)
         };
 

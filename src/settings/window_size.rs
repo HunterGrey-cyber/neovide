@@ -48,6 +48,9 @@ fn load_settings() -> Result<PersistentSettings, String> {
 }
 
 pub fn neovide_std_datapath() -> PathBuf {
+    if let Some(dir) = crate::embed::data_dir() {
+        return dir;
+    }
     dirs::data_local_dir()
         .unwrap_or_else(|| {
             warn!("Could not determine local data directory, falling back to current directory");
@@ -126,4 +129,14 @@ pub fn save_window_size(window_wrapper: &WinitWindowWrapper, settings: &Settings
 
 pub fn clamped_grid_size(grid_size: &GridSize<u32>) -> GridSize<u32> {
     grid_size.clamp(MIN_GRID_SIZE, MAX_GRID_SIZE)
+}
+
+#[cfg(test)]
+mod embed_datapath_tests {
+    use super::neovide_std_datapath;
+
+    #[test]
+    fn the_data_path_is_neovides_own_without_an_embedder() {
+        assert!(neovide_std_datapath().ends_with("neovide"));
+    }
 }

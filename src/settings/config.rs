@@ -37,6 +37,9 @@ fn neovide_config_dir() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    if let Some(file) = crate::embed::config_file() {
+        return file;
+    }
     env::var("NEOVIDE_CONFIG")
         .ok()
         .map(PathBuf::from)
@@ -469,5 +472,12 @@ mod tests {
         let events = [DebouncedEvent::new(event, Instant::now())];
 
         assert!(events_relevant_to_config(&events, Path::new("/tmp/config.toml")));
+    }
+
+    #[test]
+    fn the_config_path_is_neovides_own_without_an_embedder() {
+        if env::var_os("NEOVIDE_CONFIG").is_none() {
+            assert_eq!(config_path(), neovide_config_dir().join(CONFIG_FILE));
+        }
     }
 }

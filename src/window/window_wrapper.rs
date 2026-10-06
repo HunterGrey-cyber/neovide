@@ -101,6 +101,12 @@ fn flush_startup_messages_if_ready(result: &mut DrawCommandResult, neovim_handle
 #[path = "embed_focus.rs"]
 mod embed_focus;
 
+/// The right padding Neovide applies: its own setting plus whatever an embedder reserves, never more than the window.
+fn right_padding(settings_right: u32, left: u32, inner_width_px: u32, scale_factor: f64) -> u32 {
+    settings_right
+        + crate::embed::reserved_right(inner_width_px, left + settings_right, scale_factor)
+}
+
 fn round_or_op<Op: FnOnce(f32) -> f32>(v: f32, op: Op) -> f32 {
     let rounded = v.round();
     if v.abs_diff_eq(&rounded, GRID_TOLERANCE) { rounded } else { op(v) }
@@ -1010,6 +1016,10 @@ impl WinitWindowWrapper {
             match event {
                 WindowEvent::CloseRequested => {
                     tracy_zone!("CloseRequested");
+                    // An embedding application may keep the window open, to ask the user first.
+                    if !crate::embed::close_requested() {
+                        return false;
+                    }
                     self.handle_quit(window_id);
                 }
                 WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1091,6 +1101,11 @@ impl WinitWindowWrapper {
         }
 
         should_render |= message_selection_needs_render;
+
+        // While an embedding application's own view holds the keys, nvim is not told that the window changed focus.
+        if pending_focus_event.is_some() && crate::embed::absorb_window_focus() {
+            pending_focus_event = None;
+        }
 
         if let Some(focus) = pending_focus_event {
             if focus {
@@ -1438,6 +1453,7 @@ impl WinitWindowWrapper {
 
     pub fn draw_frame(&mut self, window_id: WindowId, dt: f32) {
         tracy_zone!("draw_frame");
+        let embed_start = std::time::Instant::now();
 
         let content_rect = self.get_content_pixel_rect_from_window(window_id);
 
@@ -1455,6 +1471,7 @@ impl WinitWindowWrapper {
         renderer.draw_frame(skia_renderer.canvas(), Some(&content_rect), dt);
 
         skia_renderer.flush();
+        crate::embed::frame_drawn(embed_start.elapsed());
 
         {
             tracy_gpu_zone!("wait for vsync");
@@ -1852,6 +1869,8 @@ impl WinitWindowWrapper {
             neovim_args: route_launch_config.neovim_args,
         };
         self.routes.insert(window.id(), route);
+        // After the route exists, so an embedding application can add its views before the first padding is read.
+        crate::embed::window_created(&window, proxy.clone(), window.id());
         #[cfg(target_os = "macos")]
         self.apply_document_state(window.id());
         self.apply_theme_for_window(window.id());
@@ -2275,6 +2294,13 @@ impl WinitWindowWrapper {
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn calculate_window_padding(&self, window_id: WindowId) -> WindowPadding {
         let window_settings = self.settings.get::<WindowSettings>();
+        let (inner_width_px, scale_factor) = self
+            .routes
+            .get(&window_id)
+            .map(|route| {
+                (route.state.saved_inner_size.width, route.window.winit_window.scale_factor())
+            })
+            .unwrap_or((0, 1.0));
 
         #[cfg(not(target_os = "macos"))]
         let window_padding_top = window_settings.padding_top;
@@ -2291,7 +2317,12 @@ impl WinitWindowWrapper {
         WindowPadding {
             top: window_padding_top,
             left: window_settings.padding_left,
-            right: window_settings.padding_right,
+            right: right_padding(
+                window_settings.padding_right,
+                window_settings.padding_left,
+                inner_width_px,
+                scale_factor,
+            ),
             bottom: window_settings.padding_bottom,
         }
     }
@@ -2869,5 +2900,15 @@ impl WinitWindowWrapper {
         if let Some(winit_color) = Self::parse_winit_color(color) {
             skia_renderer.window().set_title_text_color(winit_color);
         }
+    }
+}
+
+#[cfg(test)]
+mod embed_padding_tests {
+    use super::right_padding;
+
+    #[test]
+    fn right_padding_is_the_setting_alone_without_an_embedder() {
+        assert_eq!(right_padding(7, 3, 1000, 2.0), 7);
     }
 }
