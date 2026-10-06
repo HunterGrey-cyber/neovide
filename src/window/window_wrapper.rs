@@ -98,6 +98,9 @@ fn flush_startup_messages_if_ready(result: &mut DrawCommandResult, neovim_handle
     }
 }
 
+#[path = "embed_focus.rs"]
+mod embed_focus;
+
 fn round_or_op<Op: FnOnce(f32) -> f32>(v: f32, op: Op) -> f32 {
     let rounded = v.round();
     if v.abs_diff_eq(&rounded, GRID_TOLERANCE) { rounded } else { op(v) }
@@ -1247,6 +1250,7 @@ impl WinitWindowWrapper {
             UserEvent::ShowProgressBar { update } => {
                 self.handle_progress_bar(target, update);
             }
+            UserEvent::Embedder(event) => self.handle_embed_event(target, event),
             _ => {}
         }
     }

@@ -20,6 +20,7 @@ mod clipboard;
 mod cmd_line;
 mod dimensions;
 mod editor;
+mod embed;
 mod error_handling;
 mod frame;
 #[cfg(target_os = "macos")]

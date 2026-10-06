@@ -183,6 +183,8 @@ pub enum UserEvent {
     ShowProgressBar {
         update: ProgressBarUpdate,
     },
+    #[allow(dead_code)]
+    Embedder(crate::embed::EmbedEvent),
     #[cfg(target_os = "macos")]
     CreateWindow,
     #[cfg(target_os = "macos")]

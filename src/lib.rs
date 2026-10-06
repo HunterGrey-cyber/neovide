@@ -46,6 +46,7 @@ pub mod cmd_line;
 pub mod demo_harness;
 pub mod dimensions;
 pub mod editor;
+pub mod embed;
 pub mod error_handling;
 pub mod frame;
 #[cfg(target_os = "macos")]
