@@ -1105,6 +1105,9 @@ impl WinitWindowWrapper {
         // While an embedding application's own view holds the keys, nvim is not told that the window changed focus.
         if pending_focus_event.is_some() && crate::embed::absorb_window_focus() {
             pending_focus_event = None;
+            // The renderer already saw this window's Focused event; the cursor stays unfocused while the
+            // application's view holds the keys.
+            self.keep_cursor_unfocused(window_id);
         }
 
         if let Some(focus) = pending_focus_event {
@@ -2294,11 +2297,17 @@ impl WinitWindowWrapper {
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn calculate_window_padding(&self, window_id: WindowId) -> WindowPadding {
         let window_settings = self.settings.get::<WindowSettings>();
+        // The window's current width, not `saved_inner_size`: `prepare_frame` computes the padding before it
+        // stores the new size, and a strip clamped against last frame's wider window would outgrow a window
+        // that just shrank.
         let (inner_width_px, scale_factor) = self
             .routes
             .get(&window_id)
             .map(|route| {
-                (route.state.saved_inner_size.width, route.window.winit_window.scale_factor())
+                (
+                    route.window.winit_window.inner_size().width,
+                    route.window.winit_window.scale_factor(),
+                )
             })
             .unwrap_or((0, 1.0));
 

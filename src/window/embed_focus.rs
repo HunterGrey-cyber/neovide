@@ -20,6 +20,13 @@ impl WinitWindowWrapper {
         }
     }
 
+    /// Takes back the focus the renderer was told about when a window focus change is absorbed.
+    pub(super) fn keep_cursor_unfocused(&self, window_id: WindowId) {
+        if let Some(route) = self.routes.get(&window_id) {
+            route.window.renderer.borrow_mut().handle_event(&WindowEvent::Focused(false));
+        }
+    }
+
     fn set_editor_pane_focused(&mut self, window_id: WindowId, editor: bool) {
         let Some(route) = self.routes.get(&window_id) else {
             return;

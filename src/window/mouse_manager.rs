@@ -675,6 +675,15 @@ impl MouseManager {
         };
         let hide_mouse_when_typing = self.settings.get::<WindowSettings>().hide_mouse_when_typing;
         let mut overlay_event = OverlayEvent::default();
+        // Buttons and the wheel over the strip an embedding application reserves are not the editor's either. A
+        // press that started in the editor (a drag, a message selection) still gets its release and moves.
+        if matches!(event, WindowEvent::MouseWheel { .. } | WindowEvent::MouseInput { .. })
+            && self.drag_details.is_none()
+            && self.message_selection.is_none()
+            && crate::embed::pointer_in_reserved(f64::from(self.window_position.x))
+        {
+            return MouseEventResult { overlay_event };
+        }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 let message_selection_event = self.handle_pointer_motion(

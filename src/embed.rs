@@ -101,7 +101,9 @@ impl EmbedProxy {
 static CONFIG: OnceLock<EmbedConfig> = OnceLock::new();
 thread_local! {
     static EMBEDDER: RefCell<Option<Rc<dyn Embedder>>> = const { RefCell::new(None) };
-    /// The last layout: where the reserved strip starts, in physical pixels from the window's left edge.
+    /// The last layout: where the reserved strip starts, in physical pixels from the window's left edge. One value
+    /// for the process, not one per window: with several windows the latest layout computed decides pointer
+    /// hit-testing in all of them, which is right only while a single window is hosted.
     static STRIP_LEFT_PX: Cell<Option<f64>> = const { Cell::new(None) };
 }
 
@@ -194,6 +196,8 @@ pub fn run(config: EmbedConfig, embedder: Rc<dyn Embedder>) -> ExitCode {
         return handle_startup_errors(err, event_loop, settings.clone(), clipboard);
     }
 
+    // Upstream's `main` also sets the window theme to the background color for a transparent frame, on macOS only.
+    // That is left out: this module is platform-neutral, so an embedder that wants it sets the theme itself.
     let window_settings = load_last_window_settings().ok();
     let window_size = determine_window_size(window_settings.as_ref(), &settings);
     let grid_size = determine_grid_size(&window_size, window_settings);
@@ -419,6 +423,16 @@ mod tests {
         let _ = super::reserved_right(2480, 0, 2.0); // records the last layout: strip starts at 1600 px
         assert!(!super::pointer_in_reserved(1599.0));
         assert!(super::pointer_in_reserved(1600.0));
+        super::unregister_for_test();
+    }
+
+    #[test]
+    fn a_window_that_shrank_below_the_strip_keeps_a_valid_layout() {
+        super::register_for_test(std::rc::Rc::new(Wide(880)));
+        // 800 px wide with 10 px of Neovide's own padding: the strip takes 790 px, never the 880 asked for.
+        assert_eq!(super::reserved_right(800, 10, 1.0), 790);
+        assert_eq!(super::reserved_right(0, 0, 1.0), 0);
+        assert!(!super::pointer_in_reserved(0.0));
         super::unregister_for_test();
     }
 
